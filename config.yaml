@@ -1,0 +1,93 @@
+# CEX-DEX Arbitrage Bot Configuration
+# LocalStack Development Configuration
+
+# Ethereum blockchain configuration
+ethereum:
+  # WebSocket URLs for real-time block subscription
+  websocket_urls:
+    - "wss://mainnet.infura.io/ws/v3/29e8d6fd0f224052a10e02ca64a8260b"
+
+  # RPC endpoints for contract calls and failover
+  rpc_endpoints:
+    - url: "https://mainnet.infura.io/v3/29e8d6fd0f224052a10e02ca64a8260b"
+      weight: 1
+
+  # Reconnection settings for WebSocket
+  reconnect:
+    max_backoff: 30s
+    base_delay: 1s
+    max_delay: 30s
+    jitter: 0.2
+
+# Exchange configuration
+exchanges:
+  binance:
+    base_url: "https://api.binance.com"
+    rate_limit:
+      requests_per_minute: 1200  # Binance API limit
+      burst: 50
+    trading_fee: 0.001  # 0.1% fee
+
+# Uniswap V3 configuration
+uniswap:
+  # ETH-USDC pool address on Ethereum mainnet (0.3% fee tier)
+  pool_address: "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"
+  quoter_address: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
+  usdc_address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+  weth_address: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+
+# Arbitrage detection settings
+arbitrage:
+  # Trade sizes to test (in wei)
+  # 1 ETH = 1000000000000000000 wei
+  # 10 ETH = 10000000000000000000 wei
+  # 100 ETH = 100000000000000000000 wei
+  trade_sizes:
+    - "1000000000000000000"    # 1 ETH
+    - "10000000000000000000"   # 10 ETH
+    - "100000000000000000000"  # 100 ETH
+
+  # Minimum profit threshold (percentage)
+  # Only opportunities above this threshold will be published
+  min_profit_threshold: 0.5  # 0.5%
+
+# Redis configuration (for caching)
+redis:
+  address: "redis:6379"
+  password: ""
+  db: 0
+
+# AWS services configuration (LocalStack for development)
+aws:
+  # LocalStack endpoint for local development
+  endpoint: "http://localstack:4566"
+  region: "us-east-1"
+
+  # SNS topic ARN for publishing opportunities
+  sns_topic_arn: "arn:aws:sns:us-east-1:000000000000:arbitrage-opportunities"
+
+# Cache configuration
+cache:
+  l1_max_size: 1000  # In-memory cache max entries
+  l2_ttl: 60s        # Redis cache TTL
+
+# Observability configuration
+observability:
+  # Logging settings
+  logging:
+    level: "info"  # debug, info, warn, error
+    format: "json"  # json or text
+
+  # Metrics settings
+  metrics:
+    enabled: true
+    port: 9090  # Prometheus metrics endpoint
+
+  # Distributed tracing settings
+  tracing:
+    enabled: true
+    endpoint: "jaeger:4317"  # OTLP gRPC endpoint (Jaeger)
+
+# HTTP server configuration
+http:
+  port: 8080  # Health checks and metrics endpoint

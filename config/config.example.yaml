@@ -1,0 +1,60 @@
+ethereum:
+  websocket_urls:
+    - wss://mainnet.infura.io/ws/v3/YOUR_INFURA_KEY
+    - wss://eth-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY
+  rpc_endpoints:
+    - url: https://mainnet.infura.io/v3/YOUR_INFURA_KEY
+      weight: 1
+    - url: https://eth-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY
+      weight: 1
+  reconnect:
+    max_backoff: 30s
+    jitter: 0.2
+
+exchanges:
+  binance:
+    base_url: https://api.binance.com
+    rate_limit:
+      requests_per_minute: 1200
+      burst: 50
+
+uniswap:
+  quoter_address: "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6"
+  pool_address: "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"
+
+arbitrage:
+  # Trade sizes in Wei (1 ETH = 10^18 Wei)
+  trade_sizes:
+    - "1000000000000000000"    # 1 ETH
+    - "10000000000000000000"   # 10 ETH
+    - "100000000000000000000"  # 100 ETH
+  min_profit_threshold: 0.5  # Minimum profit percentage
+
+redis:
+  address: localhost:6379
+  password: ""
+  db: 0
+
+aws:
+  endpoint: http://localhost:4566  # LocalStack for development
+  region: us-east-1
+  sns_topic_arn: arn:aws:sns:us-east-1:000000000000:arbitrage-opportunities
+
+cache:
+  l1_max_size: 1000  # Max items in memory cache
+  l2_ttl: 60s        # Redis cache TTL
+
+observability:
+  logging:
+    level: info      # debug, info, warn, error
+    format: json     # json or text
+  metrics:
+    enabled: true
+    port: 9091
+  tracing:
+    enabled: true
+    endpoint: localhost:4317
+    sampler: always  # always, never, ratio
+
+http:
+  port: 8080  # Health checks and metrics endpoint
