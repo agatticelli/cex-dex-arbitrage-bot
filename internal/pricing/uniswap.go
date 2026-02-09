@@ -13,6 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/cache"
 	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/observability"
+	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/resilience"
 )
 
 // PoolState represents the current state of a Uniswap V3 pool
@@ -35,28 +36,31 @@ type TickInfo struct {
 
 // UniswapProvider fetches prices from Uniswap V3 using QuoterV2 contract
 type UniswapProvider struct {
-	client         *ethclient.Client
-	quoterContract *bind.BoundContract
-	poolAddress    common.Address
-	token0Address  common.Address // USDC
-	token1Address  common.Address // WETH
-	cache          cache.Cache
-	logger         *observability.Logger
-	metrics        *observability.Metrics
-	feeTiers       []uint32 // Multiple fee tiers to try (e.g., [100, 500, 3000, 10000])
+	client            *ethclient.Client
+	quoterContract    *bind.BoundContract
+	poolAddress       common.Address
+	token0Address     common.Address // USDC
+	token1Address     common.Address // WETH
+	cache             cache.Cache
+	logger            *observability.Logger
+	metrics           *observability.Metrics
+	feeTiers          []uint32 // Multiple fee tiers to try (e.g., [100, 500, 3000, 10000])
+	quoterRateLimiter *resilience.RateLimiter // Rate limiter for QuoterV2 calls
 }
 
 // UniswapProviderConfig holds Uniswap provider configuration
 type UniswapProviderConfig struct {
-	Client        *ethclient.Client
-	QuoterAddress string // QuoterV2 contract address
-	PoolAddress   string
-	Token0Address string // USDC address
-	Token1Address string // WETH address
-	Cache         cache.Cache
-	Logger        *observability.Logger
-	Metrics       *observability.Metrics
-	FeeTiers      []uint32 // Multiple fee tiers to try
+	Client           *ethclient.Client
+	QuoterAddress    string // QuoterV2 contract address
+	PoolAddress      string
+	Token0Address    string // USDC address
+	Token1Address    string // WETH address
+	Cache            cache.Cache
+	Logger           *observability.Logger
+	Metrics          *observability.Metrics
+	FeeTiers         []uint32 // Multiple fee tiers to try
+	RateLimitRPM     int      // Rate limit: requests per minute for QuoterV2 calls (default 300)
+	RateLimitBurst   int      // Rate limit: burst size (default 20)
 }
 
 // Uniswap V3 QuoterV2 ABI (for accurate price quotes)
@@ -197,6 +201,17 @@ func NewUniswapProvider(cfg UniswapProviderConfig) (*UniswapProvider, error) {
 		cfg.FeeTiers = []uint32{3000} // Default 0.3% fee if not specified
 	}
 
+	// Set rate limit defaults
+	if cfg.RateLimitRPM == 0 {
+		cfg.RateLimitRPM = 300 // Default 300 requests/minute
+	}
+	if cfg.RateLimitBurst == 0 {
+		cfg.RateLimitBurst = 20 // Default burst of 20
+	}
+
+	// Create rate limiter for QuoterV2 calls
+	rateLimiter := resilience.NewRateLimiterFromRPM(cfg.RateLimitRPM, cfg.RateLimitBurst)
+
 	// Parse addresses
 	quoterAddr := common.HexToAddress(cfg.QuoterAddress)
 	poolAddr := common.HexToAddress(cfg.PoolAddress)
@@ -213,15 +228,16 @@ func NewUniswapProvider(cfg UniswapProviderConfig) (*UniswapProvider, error) {
 	quoterContract := bind.NewBoundContract(quoterAddr, quoterABI, cfg.Client, nil, nil)
 
 	return &UniswapProvider{
-		client:         cfg.Client,
-		quoterContract: quoterContract,
-		poolAddress:    poolAddr,
-		token0Address:  token0Addr,
-		token1Address:  token1Addr,
-		cache:          cfg.Cache,
-		logger:         cfg.Logger,
-		metrics:        cfg.Metrics,
-		feeTiers:       cfg.FeeTiers,
+		client:            cfg.Client,
+		quoterContract:    quoterContract,
+		poolAddress:       poolAddr,
+		token0Address:     token0Addr,
+		token1Address:     token1Addr,
+		cache:             cfg.Cache,
+		logger:            cfg.Logger,
+		metrics:           cfg.Metrics,
+		feeTiers:          cfg.FeeTiers,
+		quoterRateLimiter: rateLimiter,
 	}, nil
 }
 
@@ -328,6 +344,11 @@ func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int,
 			SqrtPriceLimitX96: big.NewInt(0),
 		}
 
+		// Wait for rate limiter before calling QuoterV2
+		if err := u.quoterRateLimiter.Wait(ctx); err != nil {
+			return nil, fmt.Errorf("rate limiter: %w", err)
+		}
+
 		err := u.quoterContract.Call(callOpts, &result, "quoteExactOutputSingle", params)
 		if err != nil {
 			return nil, fmt.Errorf("QuoterV2 quoteExactOutputSingle failed: %w", err)
@@ -352,6 +373,11 @@ func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int,
 			AmountIn:          size, // ETH input
 			Fee:               big.NewInt(int64(feeTier)),
 			SqrtPriceLimitX96: big.NewInt(0),
+		}
+
+		// Wait for rate limiter before calling QuoterV2
+		if err := u.quoterRateLimiter.Wait(ctx); err != nil {
+			return nil, fmt.Errorf("rate limiter: %w", err)
 		}
 
 		err := u.quoterContract.Call(callOpts, &result, "quoteExactInputSingle", params)
