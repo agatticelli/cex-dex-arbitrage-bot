@@ -151,15 +151,17 @@ func main() {
 
 	// Uniswap provider (using QuoterV2 for accurate pricing)
 	uniswapProvider, err := pricing.NewUniswapProvider(pricing.UniswapProviderConfig{
-		Client:        ethClient,
-		QuoterAddress: cfg.Uniswap.QuoterAddress,
-		PoolAddress:   cfg.Uniswap.PoolAddress,
-		Token0Address: cfg.Uniswap.USDCAddress,
-		Token1Address: cfg.Uniswap.WETHAddress,
-		Cache:         layeredCache,
-		Logger:        logger,
-		Metrics:       metrics,
-		FeeTiers:      cfg.Uniswap.FeeTiers, // Try all configured fee tiers (100/500/3000/10000)
+		Client:         ethClient,
+		QuoterAddress:  cfg.Uniswap.QuoterAddress,
+		PoolAddress:    cfg.Uniswap.PoolAddress,
+		Token0Address:  cfg.Uniswap.USDCAddress,
+		Token1Address:  cfg.Uniswap.WETHAddress,
+		Cache:          layeredCache,
+		Logger:         logger,
+		Metrics:        metrics,
+		FeeTiers:       cfg.Uniswap.FeeTiers,                      // Try all configured fee tiers
+		RateLimitRPM:   cfg.Uniswap.RateLimit.RequestsPerMinute,  // QuoterV2 rate limit
+		RateLimitBurst: cfg.Uniswap.RateLimit.Burst,              // Burst size
 	})
 	if err != nil {
 		logger.LogError(ctx, "failed to create Uniswap provider", err)

@@ -81,10 +81,12 @@ cex-dex-arbitrage-bot/
 
 **Multi-Fee-Tier Optimization**: Automatically selects the best execution price across all fee tiers:
 
-- **Four Fee Tiers**: 100 bps (0.01%), 500 bps (0.05%), 3000 bps (0.3%), 10000 bps (1%)
-- **Best Execution**: For each quote, tries all tiers and selects optimal price
+- **Four Fee Tiers Available**: 100 bps (0.01%), 500 bps (0.05%), 3000 bps (0.3%), 10000 bps (1%)
+- **Configurable**: Default config uses [500, 3000] for Infura free tier compatibility
+- **Best Execution**: For each quote, tries all configured tiers and selects optimal price
 - **Metrics Tracking**: Records which tier was selected via `arbitrage.fee_tier.selected` metric
 - **Liquidity-Aware**: Lower fee tiers may have less liquidity but better pricing for small sizes
+- **Rate Limited**: Configurable rate limiting (default 60 RPM) to avoid hitting RPC provider limits
 
 **Why QuoterV2 Over Direct Math?**
 - Initial plan included direct pool state calculation, but production requirements favored reliability over complexity
@@ -148,7 +150,13 @@ if err := g.Wait(); err != nil { /* handle */ }
 
 **Rate Limiting** (Token Bucket):
 - Binance: 1200 requests/minute with burst 50
+- Uniswap QuoterV2: Configurable (default 60 RPM for Infura free tier)
 - Prevents hitting API rate limits
+
+**RPC Provider Configuration**:
+- **Infura Free Tier** (default): Use 2 fee tiers [500, 3000] + 60 RPM limit
+- **Alchemy/Infura Paid**: Use all 4 tiers [100, 500, 3000, 10000] + 300 RPM limit
+- Configurable in `config.yaml` under `uniswap.fee_tiers` and `uniswap.rate_limit`
 
 **Layered Caching**:
 - L1 (in-memory LRU): Sub-millisecond latency for hot data (pool state, gas prices)

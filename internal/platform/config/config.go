@@ -63,7 +63,11 @@ type UniswapConfig struct {
 	PoolAddress   string   `mapstructure:"pool_address"` // Still used for cache key
 	USDCAddress   string   `mapstructure:"usdc_address"`
 	WETHAddress   string   `mapstructure:"weth_address"`
-	FeeTiers      []uint32 `mapstructure:"fee_tiers"` // Try all standard Uniswap V3 tiers: [100, 500, 3000, 10000]
+	FeeTiers      []uint32 `mapstructure:"fee_tiers"` // Fee tiers to try: [100, 500, 3000, 10000]
+	RateLimit     struct {
+		RequestsPerMinute int `mapstructure:"requests_per_minute"` // QuoterV2 rate limit
+		Burst             int `mapstructure:"burst"`               // Burst size
+	} `mapstructure:"rate_limit"`
 }
 
 // ArbitrageConfig holds arbitrage detection settings
