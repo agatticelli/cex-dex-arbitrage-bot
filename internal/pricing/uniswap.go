@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -39,28 +40,41 @@ type UniswapProvider struct {
 	client            *ethclient.Client
 	quoterContract    *bind.BoundContract
 	poolAddress       common.Address
-	token0Address     common.Address // USDC
-	token1Address     common.Address // WETH
+	token0Address     common.Address // Quote token (e.g., USDC)
+	token1Address     common.Address // Base token (e.g., WETH)
+	token0Decimals    int            // Quote token decimals
+	token1Decimals    int            // Base token decimals
+	pairName          string         // e.g., "ETH-USDC"
 	cache             cache.Cache
 	logger            *observability.Logger
 	metrics           *observability.Metrics
-	feeTiers          []uint32 // Multiple fee tiers to try (e.g., [100, 500, 3000, 10000])
+	feeTiers          []uint32                // Multiple fee tiers to try (e.g., [100, 500, 3000, 10000])
 	quoterRateLimiter *resilience.RateLimiter // Rate limiter for QuoterV2 calls
+	retryCfg          resilience.RetryConfig
+	cb                *resilience.CircuitBreaker
+
+	healthMu sync.RWMutex
+	health   ProviderHealth
 }
 
 // UniswapProviderConfig holds Uniswap provider configuration
 type UniswapProviderConfig struct {
-	Client           *ethclient.Client
-	QuoterAddress    string // QuoterV2 contract address
-	PoolAddress      string
-	Token0Address    string // USDC address
-	Token1Address    string // WETH address
-	Cache            cache.Cache
-	Logger           *observability.Logger
-	Metrics          *observability.Metrics
-	FeeTiers         []uint32 // Multiple fee tiers to try
-	RateLimitRPM     int      // Rate limit: requests per minute for QuoterV2 calls (default 300)
-	RateLimitBurst   int      // Rate limit: burst size (default 20)
+	Client         *ethclient.Client
+	QuoterAddress  string // QuoterV2 contract address
+	PoolAddress    string
+	Token0Address  string // Quote token address (e.g., USDC)
+	Token1Address  string // Base token address (e.g., WETH)
+	Token0Decimals int    // Quote token decimals
+	Token1Decimals int    // Base token decimals
+	PairName       string // Pair name for metrics (e.g., "ETH-USDC")
+	Cache          cache.Cache
+	Logger         *observability.Logger
+	Metrics        *observability.Metrics
+	FeeTiers       []uint32 // Multiple fee tiers to try
+	RateLimitRPM   int      // Rate limit: requests per minute for QuoterV2 calls (default 300)
+	RateLimitBurst int      // Rate limit: burst size (default 20)
+	RetryConfig    resilience.RetryConfig
+	CircuitBreaker *resilience.CircuitBreaker
 }
 
 // Uniswap V3 QuoterV2 ABI (for accurate price quotes)
@@ -196,6 +210,9 @@ func NewUniswapProvider(cfg UniswapProviderConfig) (*UniswapProvider, error) {
 	if cfg.Token0Address == "" || cfg.Token1Address == "" {
 		return nil, fmt.Errorf("token addresses are required")
 	}
+	if cfg.Token0Decimals == 0 || cfg.Token1Decimals == 0 {
+		return nil, fmt.Errorf("token decimals are required")
+	}
 
 	if len(cfg.FeeTiers) == 0 {
 		cfg.FeeTiers = []uint32{3000} // Default 0.3% fee if not specified
@@ -208,9 +225,40 @@ func NewUniswapProvider(cfg UniswapProviderConfig) (*UniswapProvider, error) {
 	if cfg.RateLimitBurst == 0 {
 		cfg.RateLimitBurst = 20 // Default burst of 20
 	}
+	if cfg.RetryConfig.MaxAttempts == 0 {
+		cfg.RetryConfig = resilience.RetryConfig{
+			MaxAttempts: 2,
+			BaseDelay:   200 * time.Millisecond,
+			MaxDelay:    1 * time.Second,
+			Jitter:      0.2,
+		}
+	}
 
 	// Create rate limiter for QuoterV2 calls
 	rateLimiter := resilience.NewRateLimiterFromRPM(cfg.RateLimitRPM, cfg.RateLimitBurst)
+
+	// Create circuit breaker if not provided
+	cb := cfg.CircuitBreaker
+	serviceName := "uniswap"
+	if cfg.PairName != "" {
+		serviceName = fmt.Sprintf("uniswap:%s", cfg.PairName)
+	}
+	if cb == nil {
+		cb = resilience.NewCircuitBreaker(resilience.CircuitBreakerConfig{
+			Name:             serviceName,
+			FailureThreshold: 5,
+			SuccessThreshold: 2,
+			Timeout:          30 * time.Second,
+			OnStateChange: func(from, to resilience.State) {
+				if cfg.Metrics != nil {
+					cfg.Metrics.SetCircuitBreakerState(context.Background(), serviceName, int64(to))
+				}
+			},
+		})
+	}
+	if cfg.Metrics != nil {
+		cfg.Metrics.SetCircuitBreakerState(context.Background(), serviceName, cb.StateInt())
+	}
 
 	// Parse addresses
 	quoterAddr := common.HexToAddress(cfg.QuoterAddress)
@@ -233,11 +281,20 @@ func NewUniswapProvider(cfg UniswapProviderConfig) (*UniswapProvider, error) {
 		poolAddress:       poolAddr,
 		token0Address:     token0Addr,
 		token1Address:     token1Addr,
+		token0Decimals:    cfg.Token0Decimals,
+		token1Decimals:    cfg.Token1Decimals,
+		pairName:          cfg.PairName,
 		cache:             cfg.Cache,
 		logger:            cfg.Logger,
 		metrics:           cfg.Metrics,
 		feeTiers:          cfg.FeeTiers,
 		quoterRateLimiter: rateLimiter,
+		retryCfg:          cfg.RetryConfig,
+		cb:                cb,
+		health: ProviderHealth{
+			Provider: "uniswap",
+			Pair:     cfg.PairName,
+		},
 	}, nil
 }
 
@@ -245,7 +302,8 @@ func NewUniswapProvider(cfg UniswapProviderConfig) (*UniswapProvider, error) {
 // and returning the best execution price
 // gasPrice is optional - if nil, will fetch from network (expensive)
 // If provided (cached from detector), uses it directly (efficient)
-func (u *UniswapProvider) GetPrice(ctx context.Context, size *big.Int, isToken0In bool, gasPrice *big.Int) (*Price, error) {
+// blockNum is used for per-block caching to reduce RPC calls
+func (u *UniswapProvider) GetPrice(ctx context.Context, size *big.Int, isToken0In bool, gasPrice *big.Int, blockNum uint64) (*Price, error) {
 	start := time.Now()
 
 	// Try all fee tiers and pick the best execution price
@@ -253,7 +311,7 @@ func (u *UniswapProvider) GetPrice(ctx context.Context, size *big.Int, isToken0I
 	var bestAmountOut *big.Float // For comparison
 
 	for _, feeTier := range u.feeTiers {
-		price, err := u.getPriceForFeeTier(ctx, size, isToken0In, gasPrice, feeTier)
+		price, err := u.getPriceForFeeTier(ctx, size, isToken0In, gasPrice, feeTier, blockNum)
 		if err != nil {
 			u.logger.Warn("fee tier quote failed",
 				"fee_tier", feeTier,
@@ -305,9 +363,35 @@ func (u *UniswapProvider) GetPrice(ctx context.Context, size *big.Int, isToken0I
 	return bestPrice, nil
 }
 
-// getPriceForFeeTier fetches price for a specific fee tier
-func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int, isToken0In bool, gasPrice *big.Int, feeTier uint32) (*Price, error) {
+// getPriceForFeeTier fetches price for a specific fee tier with per-block caching
+func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int, isToken0In bool, gasPrice *big.Int, feeTier uint32, blockNum uint64) (*Price, error) {
 	start := time.Now()
+
+	// Build cache key (includes block number for per-block TTL)
+	cacheKey := u.buildQuoteCacheKey(blockNum, size, isToken0In, feeTier)
+
+	// Try cache first
+	if u.cache != nil {
+		if cached, err := u.cache.Get(ctx, cacheKey); err == nil {
+			if price, ok := cached.(*Price); ok {
+				u.logger.Debug("cache hit for DEX quote",
+					"block", blockNum,
+					"fee_tier", feeTier,
+					"direction", map[bool]string{true: "buy", false: "sell"}[isToken0In],
+				)
+				if u.metrics != nil {
+					u.metrics.RecordCacheHit(ctx, "uniswap")
+					u.metrics.RecordQuoteCacheRequest(ctx, u.pairName, feeTier, "uniswap", "L1", true)
+				}
+				return price, nil
+			}
+		} else {
+			if u.metrics != nil {
+				u.metrics.RecordCacheMiss(ctx, "uniswap")
+				u.metrics.RecordQuoteCacheRequest(ctx, u.pairName, feeTier, "uniswap", "L1", false)
+			}
+		}
+	}
 
 	// PRODUCTION-READY: Use QuoterV2 for accurate price quotes
 	// QuoterV2 handles all the complex Uniswap V3 math internally:
@@ -317,15 +401,37 @@ func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int,
 	// - Gas estimation for the actual swap
 
 	// Determine token addresses and call appropriate QuoterV2 method
-	// Note: The `size` parameter is always in ETH wei for both directions
+	// Note: The `size` parameter is always in base token raw units for both directions
 	var tokenIn, tokenOut common.Address
 	var result []interface{}
 	callOpts := &bind.CallOpts{Context: ctx}
 
+	// Track QuoterV2 call timing
+	quoterStart := time.Now()
+	var quoterErr error
+
+	callQuoter := func(method string, params interface{}) error {
+		if u.cb == nil {
+			return fmt.Errorf("quoter circuit breaker not initialized")
+		}
+		callStart := time.Now()
+		err := u.cb.Execute(ctx, func(ctx context.Context) error {
+			return resilience.RetryIf(ctx, u.retryCfg, resilience.IsRetryable, func(ctx context.Context) error {
+				// Wait for rate limiter before calling QuoterV2
+				if err := u.quoterRateLimiter.Wait(ctx); err != nil {
+					return fmt.Errorf("rate limiter: %w", err)
+				}
+				return u.quoterContract.Call(callOpts, &result, method, params)
+			})
+		})
+		u.recordHealth(err, time.Since(callStart))
+		return err
+	}
+
 	if isToken0In {
-		// Buying ETH with USDC: USDC (token0) -> ETH (token1)
-		// size is the ETH amount we want to buy (in wei)
-		// Use quoteExactOutputSingle to get required USDC for exact ETH output
+		// Buying base with quote: quote (token0) -> base (token1)
+		// size is the base token amount we want to buy (raw units)
+		// Use quoteExactOutputSingle to get required quote for exact base output
 
 		tokenIn = u.token0Address
 		tokenOut = u.token1Address
@@ -339,24 +445,23 @@ func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int,
 		}{
 			TokenIn:           tokenIn,
 			TokenOut:          tokenOut,
-			Amount:            size, // Desired ETH output
+			Amount:            size, // Desired base output
 			Fee:               big.NewInt(int64(feeTier)),
 			SqrtPriceLimitX96: big.NewInt(0),
 		}
 
-		// Wait for rate limiter before calling QuoterV2
-		if err := u.quoterRateLimiter.Wait(ctx); err != nil {
-			return nil, fmt.Errorf("rate limiter: %w", err)
-		}
-
-		err := u.quoterContract.Call(callOpts, &result, "quoteExactOutputSingle", params)
-		if err != nil {
-			return nil, fmt.Errorf("QuoterV2 quoteExactOutputSingle failed: %w", err)
+		quoterErr = callQuoter("quoteExactOutputSingle", params)
+		if quoterErr != nil {
+			// Record failed QuoterV2 call
+			if u.metrics != nil {
+				u.metrics.RecordQuoterCall(ctx, feeTier, "error", time.Since(quoterStart))
+			}
+			return nil, fmt.Errorf("QuoterV2 quoteExactOutputSingle failed: %w", quoterErr)
 		}
 	} else {
-		// Selling ETH for USDC: ETH (token1) -> USDC (token0)
-		// size is the ETH amount we want to sell (in wei)
-		// Use quoteExactInputSingle to get USDC output for exact ETH input
+		// Selling base for quote: base (token1) -> quote (token0)
+		// size is the base token amount we want to sell (raw units)
+		// Use quoteExactInputSingle to get quote output for exact base input
 
 		tokenIn = u.token1Address
 		tokenOut = u.token0Address
@@ -370,20 +475,24 @@ func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int,
 		}{
 			TokenIn:           tokenIn,
 			TokenOut:          tokenOut,
-			AmountIn:          size, // ETH input
+			AmountIn:          size, // Base input
 			Fee:               big.NewInt(int64(feeTier)),
 			SqrtPriceLimitX96: big.NewInt(0),
 		}
 
-		// Wait for rate limiter before calling QuoterV2
-		if err := u.quoterRateLimiter.Wait(ctx); err != nil {
-			return nil, fmt.Errorf("rate limiter: %w", err)
+		quoterErr = callQuoter("quoteExactInputSingle", params)
+		if quoterErr != nil {
+			// Record failed QuoterV2 call
+			if u.metrics != nil {
+				u.metrics.RecordQuoterCall(ctx, feeTier, "error", time.Since(quoterStart))
+			}
+			return nil, fmt.Errorf("QuoterV2 quoteExactInputSingle failed: %w", quoterErr)
 		}
+	}
 
-		err := u.quoterContract.Call(callOpts, &result, "quoteExactInputSingle", params)
-		if err != nil {
-			return nil, fmt.Errorf("QuoterV2 quoteExactInputSingle failed: %w", err)
-		}
+	// Record successful QuoterV2 call
+	if u.metrics != nil {
+		u.metrics.RecordQuoterCall(ctx, feeTier, "success", time.Since(quoterStart))
 	}
 
 	// Parse results - format differs between quoteExactInputSingle and quoteExactOutputSingle
@@ -393,36 +502,28 @@ func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int,
 	ticksCrossed := result[2].(uint32)
 	gasEstimate := result[3].(*big.Int)
 
-	var amountOutUSDC *big.Float
+	var amountOutQuote *big.Float
 	var effectivePrice *big.Float
-	var amountOutETH *big.Float // For logging
+	var amountOutBase *big.Float // For logging
 
 	if isToken0In {
-		// Buying ETH with USDC: used quoteExactOutputSingle
-		// firstAmount is the USDC input required
-		// size is the ETH output (what we requested)
+		// Buying base with quote: used quoteExactOutputSingle
+		// firstAmount is the quote input required
+		// size is the base output (what we requested)
+		quoteSpent := rawToFloat(firstAmount, u.token0Decimals)
+		amountOutBase = rawToFloat(size, u.token1Decimals)
 
-		usdcSpent := new(big.Float).SetInt(firstAmount)
-		usdcSpent.Quo(usdcSpent, big.NewFloat(1e6))
-
-		amountOutETH = new(big.Float).SetInt(size)
-		amountOutETH.Quo(amountOutETH, big.NewFloat(1e18))
-
-		// Price = USDC spent / ETH received
-		effectivePrice = new(big.Float).Quo(usdcSpent, amountOutETH)
-		amountOutUSDC = usdcSpent
+		// Price = quote spent / base received
+		effectivePrice = new(big.Float).Quo(quoteSpent, amountOutBase)
+		amountOutQuote = quoteSpent
 	} else {
-		// Selling ETH for USDC: used quoteExactInputSingle
-		// firstAmount is the USDC output received
-		// size is the ETH input
+		// Selling base for quote: used quoteExactInputSingle
+		// firstAmount is the quote output received
+		// size is the base input
+		amountOutQuote = rawToFloat(firstAmount, u.token0Decimals)
+		amountInBase := rawToFloat(size, u.token1Decimals)
 
-		amountOutUSDC = new(big.Float).SetInt(firstAmount)
-		amountOutUSDC.Quo(amountOutUSDC, big.NewFloat(1e6))
-
-		ethAmount := new(big.Float).SetInt(size)
-		ethAmount.Quo(ethAmount, big.NewFloat(1e18))
-
-		effectivePrice = new(big.Float).Quo(amountOutUSDC, ethAmount)
+		effectivePrice = new(big.Float).Quo(amountOutQuote, amountInBase)
 	}
 
 	// Calculate slippage from sqrtPriceAfter (price impact percentage)
@@ -454,13 +555,13 @@ func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int,
 	// Log with clear interpretation
 	feeMultiplier := float64(feeTier) / 1000000.0
 	if isToken0In {
-		// Buying ETH with USDC
+		// Buying base with quote
 		u.logger.Info("fetched Uniswap price (QuoterV2)",
-			"action", "buy_eth_with_usdc",
-			"eth_requested_wei", size.String(),
-			"eth_requested_normalized", amountOutETH.Text('f', 4),
-			"usdc_required_raw", firstAmount.String(),
-			"usdc_spent", amountOutUSDC.Text('f', 2),
+			"action", "buy_base_with_quote",
+			"base_requested_raw", size.String(),
+			"base_requested_normalized", amountOutBase.Text('f', 4),
+			"quote_required_raw", firstAmount.String(),
+			"quote_spent", amountOutQuote.Text('f', 2),
 			"price", effectivePrice.Text('f', 2),
 			"slippage_pct", slippagePct,
 			"ticks_crossed", ticksCrossed,
@@ -469,15 +570,14 @@ func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int,
 			"duration_ms", duration.Milliseconds(),
 		)
 	} else {
-		// Selling ETH for USDC
-		ethAmount := new(big.Float).SetInt(size)
-		ethAmount.Quo(ethAmount, big.NewFloat(1e18))
+		// Selling base for quote
+		baseAmount := rawToFloat(size, u.token1Decimals)
 		u.logger.Info("fetched Uniswap price (QuoterV2)",
-			"action", "sell_eth_for_usdc",
-			"eth_input_wei", size.String(),
-			"eth_input_normalized", ethAmount.Text('f', 4),
-			"usdc_output_raw", firstAmount.String(),
-			"usdc_received", amountOutUSDC.Text('f', 2),
+			"action", "sell_base_for_quote",
+			"base_input_raw", size.String(),
+			"base_input_normalized", baseAmount.Text('f', 4),
+			"quote_output_raw", firstAmount.String(),
+			"quote_received", amountOutQuote.Text('f', 2),
 			"price", effectivePrice.Text('f', 2),
 			"slippage_pct", slippagePct,
 			"ticks_crossed", ticksCrossed,
@@ -487,26 +587,44 @@ func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int,
 		)
 	}
 
-	// Convert amountOutUSDC back to raw format for Price struct
+	// Convert amountOutQuote back to raw format for Price struct
 	amountOutRawInt := new(big.Int)
 	if isToken0In {
-		// For buying ETH, firstAmount is already USDC in raw format
+		// For buying base, firstAmount is already quote in raw format
 		amountOutRawInt = firstAmount
 	} else {
-		// For selling ETH, firstAmount is already USDC in raw format
+		// For selling base, firstAmount is already quote in raw format
 		amountOutRawInt = firstAmount
 	}
 
-	return &Price{
-		Value:        effectivePrice,
-		AmountOut:    amountOutUSDC,
-		AmountOutRaw: amountOutRawInt,
-		Slippage:     big.NewFloat(slippagePct / 100), // Convert to decimal
-		GasCost:      gasCost,
-		TradingFee:   big.NewFloat(feeMultiplier),
-		FeeTier:      feeTier, // Track which fee tier was used
-		Timestamp:    time.Now(),
-	}, nil
+	price := &Price{
+		Value:         effectivePrice,
+		AmountOut:     amountOutQuote,
+		AmountOutRaw:  amountOutRawInt,
+		Slippage:      big.NewFloat(slippagePct), // Percent to match CEX slippage units
+		GasCost:       gasCost,
+		TradingFee:    big.NewFloat(feeMultiplier),
+		FeeTier:       feeTier, // Track which fee tier was used
+		BaseDecimals:  u.token1Decimals,
+		QuoteDecimals: u.token0Decimals,
+		Timestamp:     time.Now(),
+	}
+
+	// Cache with 15s TTL (~1.25 blocks)
+	if u.cache != nil {
+		ttl := 15 * time.Second
+		if err := u.cache.Set(ctx, cacheKey, price, ttl); err != nil {
+			u.logger.Warn("failed to cache DEX quote", "error", err)
+		} else {
+			u.logger.Debug("cached DEX quote",
+				"block", blockNum,
+				"fee_tier", feeTier,
+				"ttl_seconds", 15,
+			)
+		}
+	}
+
+	return price, nil
 }
 
 // GetPoolState fetches the current state of the Uniswap V3 pool
@@ -514,19 +632,19 @@ func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int,
 // estimateGasCostWithPrice calculates gas cost using provided gas price
 // No RPC call - uses size-based heuristics for gas units
 func (u *UniswapProvider) estimateGasCostWithPrice(size *big.Int, gasPrice *big.Int) *big.Int {
-	// Size buckets based on typical Uniswap V3 gas usage
-	sizeETH := new(big.Float).Quo(new(big.Float).SetInt(size), big.NewFloat(1e18))
-	sizeFloat, _ := sizeETH.Float64()
+	// Size buckets based on typical Uniswap V3 gas usage (base token decimals)
+	sizeBase := rawToFloat(size, u.token1Decimals)
+	sizeFloat, _ := sizeBase.Float64()
 
 	var estimatedGas int64
 	switch {
-	case sizeFloat < 5: // Small trades (< 5 ETH)
+	case sizeFloat < 5: // Small trades (< 5 base units)
 		estimatedGas = 125000
-	case sizeFloat < 50: // Medium trades (5-50 ETH)
+	case sizeFloat < 50: // Medium trades (5-50 base units)
 		estimatedGas = 165000
-	case sizeFloat < 200: // Large trades (50-200 ETH)
+	case sizeFloat < 200: // Large trades (50-200 base units)
 		estimatedGas = 240000
-	default: // Whale trades (> 200 ETH)
+	default: // Whale trades (> 200 base units)
 		estimatedGas = 350000
 	}
 
@@ -547,4 +665,52 @@ func (u *UniswapProvider) EstimateGasCost(ctx context.Context, size *big.Int, is
 
 	// Use the new size-based estimation
 	return u.estimateGasCostWithPrice(size, gasPrice), nil
+}
+
+// buildQuoteCacheKey builds a cache key for DEX quotes
+// Key format: dex:quote:v1:{blockNum}:{token0}:{token1}:{size}:{direction}:{feeTier}
+// Example: dex:quote:v1:12345:0xA0b86991:0xC02aaA39:1000000000000000000:buy:500
+func (u *UniswapProvider) buildQuoteCacheKey(blockNum uint64, size *big.Int, isToken0In bool, feeTier uint32) string {
+	var tokenIn, tokenOut, direction string
+
+	if isToken0In {
+		tokenIn = u.token0Address.Hex()[:10] // First 10 chars (0x + 8 hex)
+		tokenOut = u.token1Address.Hex()[:10]
+		direction = "buy"
+	} else {
+		tokenIn = u.token1Address.Hex()[:10]
+		tokenOut = u.token0Address.Hex()[:10]
+		direction = "sell"
+	}
+
+	return fmt.Sprintf("dex:quote:v1:%d:%s:%s:%s:%s:%d",
+		blockNum, tokenIn, tokenOut, size.String(), direction, feeTier)
+}
+
+// Health returns the current health status of the Uniswap provider.
+func (u *UniswapProvider) Health() ProviderHealth {
+	u.healthMu.RLock()
+	defer u.healthMu.RUnlock()
+	h := u.health
+	if u.cb != nil {
+		h.CircuitState = u.cb.State().String()
+	}
+	return h
+}
+
+func (u *UniswapProvider) recordHealth(err error, duration time.Duration) {
+	u.healthMu.Lock()
+	defer u.healthMu.Unlock()
+
+	u.health.LastDuration = duration
+	if err == nil {
+		u.health.LastSuccess = time.Now()
+		u.health.LastError = ""
+		u.health.ConsecutiveFailures = 0
+		return
+	}
+
+	u.health.LastFailure = time.Now()
+	u.health.LastError = err.Error()
+	u.health.ConsecutiveFailures++
 }

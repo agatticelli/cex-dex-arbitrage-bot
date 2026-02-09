@@ -35,8 +35,22 @@ type Metrics struct {
 	DEXQuoteDuration metric.Float64Histogram
 	DEXQuoteCalls    metric.Int64Counter
 
+	// QuoterV2 specific metrics
+	QuoterCallsTotal metric.Int64Counter
+	QuoterDuration   metric.Float64Histogram
+
+	// Quote cache metrics
+	QuoteCacheRequests metric.Int64Counter
+
 	// Fee tier metrics
 	FeeTierSelected metric.Int64Counter
+
+	// ETH price metrics
+	ETHPriceUSD metric.Float64Gauge
+
+	// Block gap backfill metrics
+	BlockGapBackfillTotal    metric.Int64Counter
+	BlockGapBackfillDuration metric.Float64Histogram
 
 	// WebSocket metrics
 	WebSocketReconnections metric.Int64Counter
@@ -184,10 +198,65 @@ func (m *Metrics) initMetrics() error {
 		return err
 	}
 
+	// QuoterV2 specific metrics
+	m.QuoterCallsTotal, err = m.meter.Int64Counter(
+		"arbitrage.quoter.calls",
+		metric.WithDescription("Total QuoterV2 contract calls"),
+	)
+	if err != nil {
+		return err
+	}
+
+	m.QuoterDuration, err = m.meter.Float64Histogram(
+		"arbitrage.quoter.duration",
+		metric.WithDescription("QuoterV2 call duration in milliseconds"),
+		metric.WithUnit("ms"),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Quote cache metrics
+	m.QuoteCacheRequests, err = m.meter.Int64Counter(
+		"arbitrage.quote_cache.requests",
+		metric.WithDescription("Quote cache requests (hit/miss)"),
+	)
+	if err != nil {
+		return err
+	}
+
 	// Fee tier metrics
 	m.FeeTierSelected, err = m.meter.Int64Counter(
 		"arbitrage.fee_tier.selected",
 		metric.WithDescription("Fee tier selected for best execution price"),
+	)
+	if err != nil {
+		return err
+	}
+
+	// ETH price metrics
+	m.ETHPriceUSD, err = m.meter.Float64Gauge(
+		"arbitrage.eth.price.usd",
+		metric.WithDescription("Current ETH price in USD"),
+		metric.WithUnit("USD"),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Block gap backfill metrics
+	m.BlockGapBackfillTotal, err = m.meter.Int64Counter(
+		"arbitrage.block_gap.backfill",
+		metric.WithDescription("Total blocks backfilled after gaps"),
+	)
+	if err != nil {
+		return err
+	}
+
+	m.BlockGapBackfillDuration, err = m.meter.Float64Histogram(
+		"arbitrage.block_gap.backfill_duration",
+		metric.WithDescription("Block gap backfill duration in milliseconds"),
+		metric.WithUnit("ms"),
 	)
 	if err != nil {
 		return err
@@ -280,8 +349,9 @@ func (m *Metrics) RecordBlockProcessing(ctx context.Context, duration time.Durat
 }
 
 // RecordOpportunity records an arbitrage opportunity
-func (m *Metrics) RecordOpportunity(ctx context.Context, direction string, profitable bool, profitUSD float64) {
+func (m *Metrics) RecordOpportunity(ctx context.Context, pair string, direction string, profitable bool, profitUSD float64) {
 	attrs := []attribute.KeyValue{
+		attribute.String("pair", pair),
 		attribute.String("direction", direction),
 		attribute.Bool("profitable", profitable),
 	}
@@ -394,6 +464,46 @@ func (m *Metrics) RecordFeeTierUsed(ctx context.Context, feeTier uint32) {
 	m.FeeTierSelected.Add(ctx, 1, metric.WithAttributes(
 		attribute.Int64("fee_tier", int64(feeTier)),
 	))
+}
+
+// RecordETHPrice records the current ETH price in USD
+func (m *Metrics) RecordETHPrice(ctx context.Context, priceUSD float64) {
+	m.ETHPriceUSD.Record(ctx, priceUSD)
+}
+
+// RecordQuoterCall records a QuoterV2 contract call
+func (m *Metrics) RecordQuoterCall(ctx context.Context, feeTier uint32, status string, duration time.Duration) {
+	attrs := []attribute.KeyValue{
+		attribute.Int64("fee_tier", int64(feeTier)),
+		attribute.String("status", status),
+	}
+	m.QuoterCallsTotal.Add(ctx, 1, metric.WithAttributes(attrs...))
+	m.QuoterDuration.Record(ctx, float64(duration.Milliseconds()), metric.WithAttributes(attrs...))
+}
+
+// RecordQuoteCacheRequest records a quote cache request (hit or miss)
+func (m *Metrics) RecordQuoteCacheRequest(ctx context.Context, pair string, feeTier uint32, provider, layer string, hit bool) {
+	status := "miss"
+	if hit {
+		status = "hit"
+	}
+	if pair == "" {
+		pair = "unknown"
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String("pair", pair),
+		attribute.Int64("fee_tier", int64(feeTier)),
+		attribute.String("provider", provider),
+		attribute.String("layer", layer),
+		attribute.String("status", status),
+	}
+	m.QuoteCacheRequests.Add(ctx, 1, metric.WithAttributes(attrs...))
+}
+
+// RecordBlockGapBackfill records a block gap backfill operation
+func (m *Metrics) RecordBlockGapBackfill(ctx context.Context, blocksRecovered int64, duration time.Duration) {
+	m.BlockGapBackfillTotal.Add(ctx, blocksRecovered)
+	m.BlockGapBackfillDuration.Record(ctx, float64(duration.Milliseconds()))
 }
 
 // Handler returns the HTTP handler for Prometheus metrics

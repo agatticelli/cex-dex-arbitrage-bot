@@ -14,7 +14,7 @@ type mockPriceProvider struct {
 	prices map[string]*pricing.Price // key: "buy" or "sell"
 }
 
-func (m *mockPriceProvider) GetPrice(ctx context.Context, size *big.Int, isBuy bool, gasPrice *big.Int) (*pricing.Price, error) {
+func (m *mockPriceProvider) GetPrice(ctx context.Context, size *big.Int, isBuy bool, gasPrice *big.Int, blockNum uint64) (*pricing.Price, error) {
 	if isBuy {
 		return m.prices["buy"], nil
 	}
@@ -28,7 +28,7 @@ func TestDEXDirectionMapping(t *testing.T) {
 		prices: map[string]*pricing.Price{
 			"buy": { // Buying ETH: pay MORE USDC per ETH (ask price)
 				Value:        big.NewFloat(2065.0),
-				AmountOut:    big.NewFloat(2065.0), // USDC spent
+				AmountOut:    big.NewFloat(2065.0),   // USDC spent
 				AmountOutRaw: big.NewInt(2065000000), // 2065 USDC (6 decimals)
 				GasCost:      big.NewInt(22e15),      // 0.022 ETH gas
 				TradingFee:   big.NewFloat(0.003),    // 0.3% Uniswap fee
@@ -37,7 +37,7 @@ func TestDEXDirectionMapping(t *testing.T) {
 			},
 			"sell": { // Selling ETH: receive LESS USDC per ETH (bid price)
 				Value:        big.NewFloat(2052.0),
-				AmountOut:    big.NewFloat(2052.0), // USDC received
+				AmountOut:    big.NewFloat(2052.0),   // USDC received
 				AmountOutRaw: big.NewInt(2052000000), // 2052 USDC (6 decimals)
 				GasCost:      big.NewInt(22e15),      // 0.022 ETH gas
 				TradingFee:   big.NewFloat(0.003),    // 0.3% Uniswap fee
@@ -51,7 +51,7 @@ func TestDEXDirectionMapping(t *testing.T) {
 	tradeSize := big.NewInt(1e18) // 1 ETH
 
 	// Test: Get DEX buy price (should call with isBuy=true → isToken0In=true → buying ETH with USDC)
-	dexBuyPrice, err := mockDEX.GetPrice(ctx, tradeSize, true, nil)
+	dexBuyPrice, err := mockDEX.GetPrice(ctx, tradeSize, true, nil, 0)
 	if err != nil {
 		t.Fatalf("GetPrice(buy) failed: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestDEXDirectionMapping(t *testing.T) {
 	}
 
 	// Test: Get DEX sell price (should call with isBuy=false → isToken0In=false → selling ETH for USDC)
-	dexSellPrice, err := mockDEX.GetPrice(ctx, tradeSize, false, nil)
+	dexSellPrice, err := mockDEX.GetPrice(ctx, tradeSize, false, nil, 0)
 	if err != nil {
 		t.Fatalf("GetPrice(sell) failed: %v", err)
 	}
@@ -91,13 +91,13 @@ func TestDEXDirectionMapping(t *testing.T) {
 // TestArbitrageDirectionDetection verifies correct arbitrage direction identification
 func TestArbitrageDirectionDetection(t *testing.T) {
 	tests := []struct {
-		name           string
-		cexBuyPrice    float64
-		cexSellPrice   float64
-		dexBuyPrice    float64
-		dexSellPrice   float64
-		expectedDir    Direction
-		shouldExist    bool
+		name         string
+		cexBuyPrice  float64
+		cexSellPrice float64
+		dexBuyPrice  float64
+		dexSellPrice float64
+		expectedDir  Direction
+		shouldExist  bool
 	}{
 		{
 			name:         "CEX→DEX opportunity (CEX cheaper)",
@@ -165,7 +165,7 @@ func TestArbitrageDirectionDetection(t *testing.T) {
 						Value:        big.NewFloat(tt.dexBuyPrice),
 						AmountOut:    big.NewFloat(tt.dexBuyPrice),
 						AmountOutRaw: big.NewInt(int64(tt.dexBuyPrice * 1e6)),
-						GasCost:      big.NewInt(22e15), // 0.022 ETH gas
+						GasCost:      big.NewInt(22e15),   // 0.022 ETH gas
 						TradingFee:   big.NewFloat(0.003), // 0.3% Uniswap fee
 						FeeTier:      3000,
 						Timestamp:    time.Now(),
@@ -174,7 +174,7 @@ func TestArbitrageDirectionDetection(t *testing.T) {
 						Value:        big.NewFloat(tt.dexSellPrice),
 						AmountOut:    big.NewFloat(tt.dexSellPrice),
 						AmountOutRaw: big.NewInt(int64(tt.dexSellPrice * 1e6)),
-						GasCost:      big.NewInt(22e15), // 0.022 ETH gas
+						GasCost:      big.NewInt(22e15),   // 0.022 ETH gas
 						TradingFee:   big.NewFloat(0.003), // 0.3% Uniswap fee
 						FeeTier:      3000,
 						Timestamp:    time.Now(),
@@ -185,8 +185,8 @@ func TestArbitrageDirectionDetection(t *testing.T) {
 			// Verify direction logic
 			// CEX→DEX: Buy on CEX, Sell on DEX → compare CEX buy price vs DEX sell price
 			if tt.expectedDir == CEXToDEX {
-				cexBuy, _ := mockCEX.GetPrice(context.Background(), big.NewInt(1e18), true, nil)
-				dexSell, _ := mockDEX.GetPrice(context.Background(), big.NewInt(1e18), false, nil)
+				cexBuy, _ := mockCEX.GetPrice(context.Background(), big.NewInt(1e18), true, nil, 0)
+				dexSell, _ := mockDEX.GetPrice(context.Background(), big.NewInt(1e18), false, nil, 0)
 
 				cexBuyVal, _ := cexBuy.Value.Float64()
 				dexSellVal, _ := dexSell.Value.Float64()
@@ -201,8 +201,8 @@ func TestArbitrageDirectionDetection(t *testing.T) {
 
 			// DEX→CEX: Buy on DEX, Sell on CEX → compare DEX buy price vs CEX sell price
 			if tt.expectedDir == DEXToCEX {
-				dexBuy, _ := mockDEX.GetPrice(context.Background(), big.NewInt(1e18), true, nil)
-				cexSell, _ := mockCEX.GetPrice(context.Background(), big.NewInt(1e18), false, nil)
+				dexBuy, _ := mockDEX.GetPrice(context.Background(), big.NewInt(1e18), true, nil, 0)
+				cexSell, _ := mockCEX.GetPrice(context.Background(), big.NewInt(1e18), false, nil, 0)
 
 				dexBuyVal, _ := dexBuy.Value.Float64()
 				cexSellVal, _ := cexSell.Value.Float64()
@@ -221,7 +221,7 @@ func TestArbitrageDirectionDetection(t *testing.T) {
 // TestBidAskSpread verifies that both CEX and DEX maintain proper bid-ask spreads
 func TestBidAskSpread(t *testing.T) {
 	tests := []struct {
-		name    string
+		name      string
 		buyPrice  float64
 		sellPrice float64
 		wantError bool

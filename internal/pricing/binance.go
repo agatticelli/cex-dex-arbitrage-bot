@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/cache"
@@ -17,14 +18,19 @@ import (
 
 // Price represents a price quote for a trade
 type Price struct {
-	Value       *big.Float // Effective price in quote currency (for display)
-	AmountOut   *big.Float // Actual output amount in quote currency (USDC, normalized to human-readable)
-	AmountOutRaw *big.Int  // Raw output amount (with decimals, e.g., 1e6 for USDC, 1e18 for ETH)
-	Slippage    *big.Float // Slippage percentage
-	GasCost     *big.Int   // Gas cost in wei (DEX only)
-	TradingFee  *big.Float // Trading fee percentage
-	FeeTier     uint32     // Uniswap V3 fee tier used (100/500/3000/10000 bps), 0 for CEX
-	Timestamp   time.Time
+	Value         *big.Float // Effective price in quote currency (for display)
+	AmountOut     *big.Float // Actual output amount in quote currency (normalized to human-readable)
+	AmountOutRaw  *big.Int   // Raw output amount (with decimals, e.g., 1e6 for USDC)
+	Slippage      *big.Float // Slippage percentage
+	GasCost       *big.Int   // Gas cost in wei (DEX only)
+	TradingFee    *big.Float // Trading fee percentage
+	FeeTier       uint32     // Uniswap V3 fee tier used (100/500/3000/10000 bps), 0 for CEX
+	BaseSymbol    string     // Base token symbol (e.g., ETH, BTC)
+	QuoteSymbol   string     // Quote token symbol (e.g., USDC)
+	BaseDecimals  int        // Base token decimals
+	QuoteDecimals int        // Quote token decimals
+	QuoteIsStable bool       // Whether quote token is a stablecoin (for USD conversion)
+	Timestamp     time.Time
 }
 
 // BinanceProvider fetches prices from Binance exchange
@@ -36,6 +42,11 @@ type BinanceProvider struct {
 	logger      *observability.Logger
 	metrics     *observability.Metrics
 	tradingFee  float64 // Binance trading fee (0.1% = 0.001)
+	retryCfg    resilience.RetryConfig
+	cb          *resilience.CircuitBreaker
+
+	healthMu sync.RWMutex
+	health   ProviderHealth
 }
 
 // BinanceProviderConfig holds Binance provider configuration
@@ -47,6 +58,8 @@ type BinanceProviderConfig struct {
 	Logger         *observability.Logger
 	Metrics        *observability.Metrics
 	TradingFee     float64
+	RetryConfig    resilience.RetryConfig
+	CircuitBreaker *resilience.CircuitBreaker
 }
 
 // BinanceOrderbookResponse represents Binance orderbook API response
@@ -71,9 +84,36 @@ func NewBinanceProvider(cfg BinanceProviderConfig) (*BinanceProvider, error) {
 	if cfg.TradingFee == 0 {
 		cfg.TradingFee = 0.001 // 0.1% default
 	}
+	if cfg.RetryConfig.MaxAttempts == 0 {
+		cfg.RetryConfig = resilience.RetryConfig{
+			MaxAttempts: 3,
+			BaseDelay:   200 * time.Millisecond,
+			MaxDelay:    2 * time.Second,
+			Jitter:      0.2,
+		}
+	}
 
 	// Create rate limiter
 	rateLimiter := resilience.NewRateLimiterFromRPM(cfg.RateLimitRPM, cfg.RateLimitBurst)
+
+	// Create circuit breaker if not provided
+	cb := cfg.CircuitBreaker
+	if cb == nil {
+		cb = resilience.NewCircuitBreaker(resilience.CircuitBreakerConfig{
+			Name:             "binance",
+			FailureThreshold: 5,
+			SuccessThreshold: 2,
+			Timeout:          30 * time.Second,
+			OnStateChange: func(from, to resilience.State) {
+				if cfg.Metrics != nil {
+					cfg.Metrics.SetCircuitBreakerState(context.Background(), "binance", int64(to))
+				}
+			},
+		})
+	}
+	if cfg.Metrics != nil {
+		cfg.Metrics.SetCircuitBreakerState(context.Background(), "binance", cb.StateInt())
+	}
 
 	// Create HTTP client with timeout
 	httpClient := &http.Client{
@@ -88,16 +128,27 @@ func NewBinanceProvider(cfg BinanceProviderConfig) (*BinanceProvider, error) {
 		logger:      cfg.Logger,
 		metrics:     cfg.Metrics,
 		tradingFee:  cfg.TradingFee,
+		retryCfg:    cfg.RetryConfig,
+		cb:          cb,
+		health: ProviderHealth{
+			Provider: "binance",
+		},
 	}, nil
 }
 
 // GetPrice fetches current price for a trading pair and trade size
-func (b *BinanceProvider) GetPrice(ctx context.Context, symbol string, size *big.Int, isBuy bool) (*Price, error) {
+func (b *BinanceProvider) GetPrice(ctx context.Context, symbol string, size *big.Int, isBuy bool, baseDecimals, quoteDecimals int) (*Price, error) {
 	start := time.Now()
 
-	// Convert size from wei to ETH (assuming 18 decimals)
-	sizeFloat := new(big.Float).SetInt(size)
-	ethSize := new(big.Float).Quo(sizeFloat, big.NewFloat(1e18))
+	if baseDecimals == 0 {
+		baseDecimals = 18
+	}
+	if quoteDecimals == 0 {
+		quoteDecimals = 6
+	}
+
+	// Convert size from raw units to base token amount
+	baseSize := rawToFloat(size, baseDecimals)
 
 	// Try cache first
 	cacheKey := fmt.Sprintf("binance:orderbook:%s", symbol)
@@ -135,28 +186,25 @@ func (b *BinanceProvider) GetPrice(ctx context.Context, symbol string, size *big
 	}
 
 	// Calculate execution result with actual USDC flows
-	execResult, err := orderbook.CalculateExecution(ethSize, isBuy)
+	execResult, err := orderbook.CalculateExecution(baseSize, isBuy)
 	if err != nil {
 		return nil, fmt.Errorf("failed to calculate execution: %w", err)
 	}
 
-	// For Binance (CEX), USDC uses 6 decimals (but our orderbook already uses normalized values)
-	// CRITICAL: Apply trading fees to get actual USDC flow
-	// - For BUY (buying ETH): AmountOut = USDC we SPEND = totalCost × (1 + fee)
-	// - For SELL (selling ETH): AmountOut = USDC we RECEIVE = totalCost × (1 - fee)
-	var amountOutUSDC *big.Float
+	// CRITICAL: Apply trading fees to get actual quote flow
+	// - For BUY (buying base): AmountOut = quote we SPEND = totalCost × (1 + fee)
+	// - For SELL (selling base): AmountOut = quote we RECEIVE = totalCost × (1 - fee)
+	var amountOutQuote *big.Float
 	if isBuy {
 		// When buying, we pay MORE (add fee)
-		amountOutUSDC = new(big.Float).Mul(execResult.TotalCost, big.NewFloat(1+b.tradingFee))
+		amountOutQuote = new(big.Float).Mul(execResult.TotalCost, big.NewFloat(1+b.tradingFee))
 	} else {
 		// When selling, we receive LESS (subtract fee)
-		amountOutUSDC = new(big.Float).Mul(execResult.TotalCost, big.NewFloat(1-b.tradingFee))
+		amountOutQuote = new(big.Float).Mul(execResult.TotalCost, big.NewFloat(1-b.tradingFee))
 	}
 
-	// Convert to raw format (1e6 for USDC)
-	amountOutRaw := new(big.Float).Mul(amountOutUSDC, big.NewFloat(1e6))
-	amountOutRawInt := new(big.Int)
-	amountOutRaw.Int(amountOutRawInt)
+	// Convert to raw format using quote decimals
+	amountOutRawInt := floatToRaw(amountOutQuote, quoteDecimals)
 
 	// Record metrics
 	duration := time.Since(start)
@@ -166,37 +214,110 @@ func (b *BinanceProvider) GetPrice(ctx context.Context, symbol string, size *big
 
 	b.logger.Info("fetched Binance price",
 		"symbol", symbol,
-		"size_eth", ethSize.Text('f', 4),
+		"size_base", baseSize.Text('f', 4),
 		"is_buy", isBuy,
 		"price", execResult.EffectivePrice.Text('f', 2),
 		"slippage_pct", execResult.Slippage.Text('f', 4),
-		"amount_out_usdc", amountOutUSDC.Text('f', 2),
-		"total_cost_usdc", execResult.TotalCost.Text('f', 2),
-		"total_filled_eth", execResult.TotalFilled.Text('f', 4),
+		"amount_out_quote", amountOutQuote.Text('f', 2),
+		"total_cost_quote", execResult.TotalCost.Text('f', 2),
+		"total_filled_base", execResult.TotalFilled.Text('f', 4),
 		"duration_ms", duration.Milliseconds(),
 	)
 
 	return &Price{
-		Value:        execResult.EffectivePrice,
-		AmountOut:    amountOutUSDC,       // Normalized USDC amount
-		AmountOutRaw: amountOutRawInt,     // Raw USDC (1e6 decimals)
-		Slippage:     execResult.Slippage,
-		GasCost:      big.NewInt(0),       // CEX has no gas cost
-		TradingFee:   big.NewFloat(b.tradingFee),
-		Timestamp:    time.Now(),
+		Value:         execResult.EffectivePrice,
+		AmountOut:     amountOutQuote,  // Normalized quote amount
+		AmountOutRaw:  amountOutRawInt, // Raw quote amount (quote decimals)
+		Slippage:      execResult.Slippage,
+		GasCost:       big.NewInt(0), // CEX has no gas cost
+		TradingFee:    big.NewFloat(b.tradingFee),
+		FeeTier:       0,
+		BaseDecimals:  baseDecimals,
+		QuoteDecimals: quoteDecimals,
+		Timestamp:     time.Now(),
 	}, nil
+}
+
+// GetETHPrice fetches real-time ETH/USD price from Binance orderbook
+// Returns the mid price (average of best bid and ask)
+func (b *BinanceProvider) GetETHPrice(ctx context.Context) (float64, error) {
+	cacheKey := "binance:orderbook:ETHUSDC"
+
+	var orderbook *Orderbook
+
+	// Try cache (same 10s cache as GetPrice)
+	if b.cache != nil {
+		if cached, err := b.cache.Get(ctx, cacheKey); err == nil {
+			if ob, ok := cached.(*Orderbook); ok {
+				orderbook = ob
+				b.logger.Debug("cache hit for ETH price", "symbol", "ETHUSDC")
+			}
+		}
+	}
+
+	// Fetch if not cached
+	if orderbook == nil {
+		var err error
+		orderbook, err = b.GetOrderbook(ctx, "ETHUSDC", 5)
+		if err != nil {
+			return 0, fmt.Errorf("failed to fetch ETH orderbook: %w", err)
+		}
+
+		// Cache for 10 seconds (same as GetPrice)
+		if b.cache != nil {
+			b.cache.Set(ctx, cacheKey, orderbook, 10*time.Second)
+		}
+	}
+
+	if !orderbook.IsValid() {
+		return 0, fmt.Errorf("invalid ETH orderbook")
+	}
+
+	midPrice := orderbook.GetMidPrice()
+	ethPrice, _ := midPrice.Float64()
+
+	// Sanity check: ETH price should be between $500 and $10000
+	if ethPrice < 500 || ethPrice > 10000 {
+		return 0, fmt.Errorf("ETH price outside valid range: %.2f", ethPrice)
+	}
+
+	b.logger.Debug("fetched ETH price", "price_usd", ethPrice)
+
+	return ethPrice, nil
 }
 
 // GetOrderbook fetches orderbook snapshot from Binance
 func (b *BinanceProvider) GetOrderbook(ctx context.Context, symbol string, depth int) (*Orderbook, error) {
-	// Wait for rate limiter
-	if err := b.rateLimiter.Wait(ctx); err != nil {
-		return nil, fmt.Errorf("rate limiter error: %w", err)
-	}
+	return resilience.ExecuteWithResult(b.cb, ctx, func(ctx context.Context) (*Orderbook, error) {
+		return resilience.RetryIfWithResult(ctx, b.retryCfg, resilience.IsRetryable, func(ctx context.Context) (*Orderbook, error) {
+			// Wait for rate limiter
+			if err := b.rateLimiter.Wait(ctx); err != nil {
+				return nil, fmt.Errorf("rate limiter error: %w", err)
+			}
 
-	// Build URL
-	url := fmt.Sprintf("%s/api/v3/depth?symbol=%s&limit=%d", b.baseURL, symbol, depth)
+			// Build URL
+			url := fmt.Sprintf("%s/api/v3/depth?symbol=%s&limit=%d", b.baseURL, symbol, depth)
 
+			start := time.Now()
+			orderbook, err := b.fetchOrderbook(ctx, url)
+			duration := time.Since(start)
+
+			b.recordHealth(err, duration)
+
+			if b.metrics != nil {
+				status := "success"
+				if err != nil {
+					status = "error"
+				}
+				b.metrics.RecordCEXAPICall(ctx, "binance", "orderbook", status, duration)
+			}
+
+			return orderbook, err
+		})
+	})
+}
+
+func (b *BinanceProvider) fetchOrderbook(ctx context.Context, url string) (*Orderbook, error) {
 	// Create request
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -206,9 +327,6 @@ func (b *BinanceProvider) GetOrderbook(ctx context.Context, symbol string, depth
 	// Execute request
 	resp, err := b.client.Do(req)
 	if err != nil {
-		if b.metrics != nil {
-			b.metrics.RecordCEXAPICall(ctx, "binance", "orderbook", "error", 0)
-		}
 		return nil, fmt.Errorf("failed to execute request: %w", err)
 	}
 	defer resp.Body.Close()
@@ -216,9 +334,6 @@ func (b *BinanceProvider) GetOrderbook(ctx context.Context, symbol string, depth
 	// Check status code
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		if b.metrics != nil {
-			b.metrics.RecordCEXAPICall(ctx, "binance", "orderbook", "error", 0)
-		}
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -235,6 +350,34 @@ func (b *BinanceProvider) GetOrderbook(ctx context.Context, symbol string, depth
 	}
 
 	return orderbook, nil
+}
+
+// Health returns the current health status of the Binance provider.
+func (b *BinanceProvider) Health() ProviderHealth {
+	b.healthMu.RLock()
+	defer b.healthMu.RUnlock()
+	h := b.health
+	if b.cb != nil {
+		h.CircuitState = b.cb.State().String()
+	}
+	return h
+}
+
+func (b *BinanceProvider) recordHealth(err error, duration time.Duration) {
+	b.healthMu.Lock()
+	defer b.healthMu.Unlock()
+
+	b.health.LastDuration = duration
+	if err == nil {
+		b.health.LastSuccess = time.Now()
+		b.health.LastError = ""
+		b.health.ConsecutiveFailures = 0
+		return
+	}
+
+	b.health.LastFailure = time.Now()
+	b.health.LastError = err.Error()
+	b.health.ConsecutiveFailures++
 }
 
 // parseOrderbook converts Binance API response to Orderbook

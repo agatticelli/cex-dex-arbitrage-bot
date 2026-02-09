@@ -29,9 +29,12 @@ func (c *Calculator) CalculateProfit(
 ) (*ProfitMetrics, error) {
 	metrics := &ProfitMetrics{}
 
-	// Convert trade size to ETH (normalized)
-	tradeSizeETH := new(big.Float).SetInt(tradeSize)
-	tradeSizeETH.Quo(tradeSizeETH, big.NewFloat(1e18))
+	// Convert trade size to base units (normalized)
+	baseDecimals := cexPrice.BaseDecimals
+	if baseDecimals == 0 {
+		baseDecimals = 18 // Fallback for legacy ETH-only paths
+	}
+	tradeSizeBase := rawToFloat(tradeSize, baseDecimals)
 
 	// Validate that AmountOut is populated
 	if cexPrice.AmountOut == nil || dexPrice.AmountOut == nil {
@@ -46,15 +49,15 @@ func (c *Calculator) CalculateProfit(
 		// Buy ETH on CEX (spend USDC), Sell ETH on DEX (receive USDC)
 		// CEX: AmountOut = USDC spent when buying ETH
 		// DEX: AmountOut = USDC received when selling ETH
-		usdcSpent = cexPrice.AmountOut      // USDC spent on CEX
-		usdcReceived = dexPrice.AmountOut   // USDC received on DEX
+		usdcSpent = cexPrice.AmountOut    // USDC spent on CEX
+		usdcReceived = dexPrice.AmountOut // USDC received on DEX
 		grossProfitUSDC = new(big.Float).Sub(usdcReceived, usdcSpent)
 	} else {
 		// Buy ETH on DEX (spend USDC), Sell ETH on CEX (receive USDC)
 		// DEX: AmountOut = USDC spent when buying ETH
 		// CEX: AmountOut = USDC received when selling ETH
-		usdcSpent = dexPrice.AmountOut      // USDC spent on DEX
-		usdcReceived = cexPrice.AmountOut   // USDC received on CEX
+		usdcSpent = dexPrice.AmountOut    // USDC spent on DEX
+		usdcReceived = cexPrice.AmountOut // USDC received on CEX
 		grossProfitUSDC = new(big.Float).Sub(usdcReceived, usdcSpent)
 	}
 
@@ -63,8 +66,8 @@ func (c *Calculator) CalculateProfit(
 	// We calculate them separately only to show the breakdown to the user
 	// CEX fees are now applied in Binance provider (AmountOut includes fees)
 	// DEX fees are applied in Uniswap SimulateSwap (AmountOut includes fees)
-	cexTradeValue := new(big.Float).Mul(cexPrice.Value, tradeSizeETH)
-	dexTradeValue := new(big.Float).Mul(dexPrice.Value, tradeSizeETH)
+	cexTradeValue := new(big.Float).Mul(cexPrice.Value, tradeSizeBase)
+	dexTradeValue := new(big.Float).Mul(dexPrice.Value, tradeSizeBase)
 	cexFee := new(big.Float).Mul(cexTradeValue, cexPrice.TradingFee)
 	dexFee := new(big.Float).Mul(dexTradeValue, dexPrice.TradingFee)
 	metrics.TradingFeesUSD = new(big.Float).Add(cexFee, dexFee)
@@ -75,6 +78,11 @@ func (c *Calculator) CalculateProfit(
 		gasCost = dexPrice.GasCost // Gas paid when selling on DEX
 	} else {
 		gasCost = dexPrice.GasCost // Gas paid when buying on DEX
+	}
+
+	// Handle nil gas cost gracefully (treat as zero)
+	if gasCost == nil {
+		gasCost = big.NewInt(0)
 	}
 
 	gasCostETH := new(big.Float).SetInt(gasCost)
@@ -100,9 +108,10 @@ func (c *Calculator) CalculateProfit(
 	// Only gas cost is subtracted because it's an additional cost not reflected in USDC flows
 	metrics.NetProfitUSD = new(big.Float).Sub(grossProfitUSDC, metrics.GasCostUSD)
 
-	// ASSERTION: Net profit must be less than gross profit
-	if metrics.NetProfitUSD.Cmp(metrics.GrossProfitUSD) >= 0 {
-		return nil, fmt.Errorf("FLAG_NET_PROFIT_NOT_SUBTRACTING_FEES: netProfit=%.2f >= grossProfit=%.2f",
+	// ASSERTION: Net profit must be less than or equal to gross profit
+	// (Equal when gas cost is zero)
+	if metrics.NetProfitUSD.Cmp(metrics.GrossProfitUSD) > 0 {
+		return nil, fmt.Errorf("FLAG_NET_PROFIT_EXCEEDS_GROSS: netProfit=%.2f > grossProfit=%.2f (impossible)",
 			metrics.NetProfitUSD, metrics.GrossProfitUSD)
 	}
 
@@ -117,18 +126,18 @@ func (c *Calculator) CalculateProfit(
 		// Buy on CEX, Sell on DEX
 		// Cost: cexPrice * size * (1 + cexFee)
 		// Revenue: dexPrice * size * (1 - dexFee)
-		cexCost := new(big.Float).Mul(cexPrice.Value, tradeSizeETH)
+		cexCost := new(big.Float).Mul(cexPrice.Value, tradeSizeBase)
 		cexCost.Mul(cexCost, big.NewFloat(1+cexFeeFloat))
-		dexRevenue := new(big.Float).Mul(dexPrice.Value, tradeSizeETH)
+		dexRevenue := new(big.Float).Mul(dexPrice.Value, tradeSizeBase)
 		dexRevenue.Mul(dexRevenue, big.NewFloat(1-dexFeeFloat))
 		expectedProfitApprox = new(big.Float).Sub(dexRevenue, cexCost)
 	} else {
 		// Buy on DEX, Sell on CEX
 		// Cost: dexPrice * size * (1 + dexFee)
 		// Revenue: cexPrice * size * (1 - cexFee)
-		dexCost := new(big.Float).Mul(dexPrice.Value, tradeSizeETH)
+		dexCost := new(big.Float).Mul(dexPrice.Value, tradeSizeBase)
 		dexCost.Mul(dexCost, big.NewFloat(1+dexFeeFloat))
-		cexRevenue := new(big.Float).Mul(cexPrice.Value, tradeSizeETH)
+		cexRevenue := new(big.Float).Mul(cexPrice.Value, tradeSizeBase)
 		cexRevenue.Mul(cexRevenue, big.NewFloat(1-cexFeeFloat))
 		expectedProfitApprox = new(big.Float).Sub(cexRevenue, dexCost)
 	}
@@ -156,7 +165,27 @@ func (c *Calculator) CalculateProfit(
 
 	// Calculate profit percentage
 	// Profit % = (Net Profit / Total Investment) * 100
-	totalInvestment := new(big.Float).Mul(tradeSizeETH, big.NewFloat(ethPriceUSD))
+	// Total investment should use the BUY-side price for the direction.
+	var buyPrice *pricing.Price
+	if direction == CEXToDEX {
+		buyPrice = cexPrice
+	} else {
+		buyPrice = dexPrice
+	}
+
+	// Total investment in USD (for profit percentage)
+	var totalInvestment *big.Float
+	if buyPrice.QuoteIsStable {
+		// Quote is stablecoin, treat quote as USD
+		totalInvestment = new(big.Float).Mul(tradeSizeBase, buyPrice.Value)
+	} else if buyPrice.QuoteSymbol == "ETH" {
+		// Quote is ETH, convert to USD using ethPriceUSD
+		totalInvestment = new(big.Float).Mul(tradeSizeBase, buyPrice.Value)
+		totalInvestment.Mul(totalInvestment, big.NewFloat(ethPriceUSD))
+	} else {
+		// Fallback: assume quote ~= USD (best effort)
+		totalInvestment = new(big.Float).Mul(tradeSizeBase, buyPrice.Value)
+	}
 	if totalInvestment.Cmp(big.NewFloat(0)) > 0 {
 		metrics.ProfitPct = new(big.Float).Quo(metrics.NetProfitUSD, totalInvestment)
 		metrics.ProfitPct.Mul(metrics.ProfitPct, big.NewFloat(100))
@@ -166,21 +195,21 @@ func (c *Calculator) CalculateProfit(
 
 	// DEBUG LOGGING FIELDS (stored in metrics for later logging)
 	metrics.DebugFields = map[string]interface{}{
-		"trade_size_wei":           tradeSize.String(),
-		"trade_size_eth":           tradeSizeETH.Text('f', 4),
-		"usdc_spent":               usdcSpent.Text('f', 2),
-		"usdc_received":            usdcReceived.Text('f', 2),
-		"cex_amount_out_raw":       cexPrice.AmountOutRaw.String(),
-		"dex_amount_out_raw":       dexPrice.AmountOutRaw.String(),
+		"trade_size_raw":            tradeSize.String(),
+		"trade_size_base":           tradeSizeBase.Text('f', 4),
+		"usdc_spent":                usdcSpent.Text('f', 2),
+		"usdc_received":             usdcReceived.Text('f', 2),
+		"cex_amount_out_raw":        cexPrice.AmountOutRaw.String(),
+		"dex_amount_out_raw":        dexPrice.AmountOutRaw.String(),
 		"cex_amount_out_normalized": cexPrice.AmountOut.Text('f', 2),
 		"dex_amount_out_normalized": dexPrice.AmountOut.Text('f', 2),
-		"gross_profit_usdc":        grossProfitUSDC.Text('f', 2),
-		"gas_cost_usdc":            metrics.GasCostUSD.Text('f', 2),
-		"trading_fees_usdc":        metrics.TradingFeesUSD.Text('f', 2),
-		"net_profit_usdc":          metrics.NetProfitUSD.Text('f', 2),
-		"expected_profit_approx":   expectedProfitApprox.Text('f', 2),
-		"cex_price":                cexPrice.Value.Text('f', 2),
-		"dex_price":                dexPrice.Value.Text('f', 2),
+		"gross_profit_usdc":         grossProfitUSDC.Text('f', 2),
+		"gas_cost_usdc":             metrics.GasCostUSD.Text('f', 2),
+		"trading_fees_usdc":         metrics.TradingFeesUSD.Text('f', 2),
+		"net_profit_usdc":           metrics.NetProfitUSD.Text('f', 2),
+		"expected_profit_approx":    expectedProfitApprox.Text('f', 2),
+		"cex_price":                 cexPrice.Value.Text('f', 2),
+		"dex_price":                 dexPrice.Value.Text('f', 2),
 	}
 
 	return metrics, nil
@@ -223,13 +252,17 @@ func (c *Calculator) CalculateBreakEven(
 	// For production, would use binary search to find exact break-even
 
 	// Start with small size and increase until profitable
-	minSize := new(big.Int)
-	minSize.SetString("100000000000000000", 10) // 0.1 ETH (1e17 wei)
-	maxSize := new(big.Int)
-	maxSize.SetString("100000000000000000000", 10) // 100 ETH (1e20 wei)
+	baseDecimals := cexPrice.BaseDecimals
+	if baseDecimals == 0 {
+		baseDecimals = 18
+	}
 
-	step := new(big.Int)
-	step.SetString("100000000000000000", 10) // 0.1 ETH step
+	// 0.1 base units (raw)
+	minSize := floatToRaw(0.1, baseDecimals)
+	// 100 base units (raw)
+	maxSize := floatToRaw(100.0, baseDecimals)
+	// 0.1 base step (raw)
+	step := floatToRaw(0.1, baseDecimals)
 
 	for size := new(big.Int).Set(minSize); size.Cmp(maxSize) <= 0; size.Add(size, step) {
 		metrics, err := c.CalculateProfit(direction, size, cexPrice, dexPrice, ethPriceUSD)
@@ -261,10 +294,13 @@ func (c *Calculator) CalculateMaxProfitableSize(
 	maxProfit := big.NewFloat(0)
 
 	step := new(big.Int).Div(maxSize, big.NewInt(10)) // 10 steps
-	minStep := new(big.Int)
-	minStep.SetString("100000000000000000", 10) // 0.1 ETH (1e17 wei)
+	baseDecimals := cexPrice.BaseDecimals
+	if baseDecimals == 0 {
+		baseDecimals = 18
+	}
+	minStep := floatToRaw(0.1, baseDecimals) // Minimum 0.1 base units
 	if step.Cmp(minStep) < 0 {
-		step = minStep // Minimum 0.1 ETH step
+		step = minStep // Minimum 0.1 base units
 	}
 
 	for size := new(big.Int).Set(step); size.Cmp(maxSize) <= 0; size.Add(size, step) {
@@ -288,12 +324,12 @@ func (c *Calculator) CalculateMaxProfitableSize(
 
 // ProfitMetrics holds calculated profit metrics
 type ProfitMetrics struct {
-	GrossProfitUSD  *big.Float
-	GasCostUSD      *big.Float
-	TradingFeesUSD  *big.Float
-	NetProfitUSD    *big.Float
-	ProfitPct       *big.Float
-	DebugFields     map[string]interface{} // Debug logging fields
+	GrossProfitUSD *big.Float
+	GasCostUSD     *big.Float
+	TradingFeesUSD *big.Float
+	NetProfitUSD   *big.Float
+	ProfitPct      *big.Float
+	DebugFields    map[string]interface{} // Debug logging fields
 }
 
 // String returns a string representation of profit metrics

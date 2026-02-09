@@ -10,15 +10,15 @@ import (
 
 // Config holds all configuration for the arbitrage bot
 type Config struct {
-	Ethereum     EthereumConfig     `mapstructure:"ethereum"`
-	Exchanges    ExchangesConfig    `mapstructure:"exchanges"`
-	Uniswap      UniswapConfig      `mapstructure:"uniswap"`
-	Arbitrage    ArbitrageConfig    `mapstructure:"arbitrage"`
-	Redis        RedisConfig        `mapstructure:"redis"`
-	AWS          AWSConfig          `mapstructure:"aws"`
-	Cache        CacheConfig        `mapstructure:"cache"`
+	Ethereum      EthereumConfig      `mapstructure:"ethereum"`
+	Exchanges     ExchangesConfig     `mapstructure:"exchanges"`
+	Uniswap       UniswapConfig       `mapstructure:"uniswap"`
+	Arbitrage     ArbitrageConfig     `mapstructure:"arbitrage"`
+	Redis         RedisConfig         `mapstructure:"redis"`
+	AWS           AWSConfig           `mapstructure:"aws"`
+	Cache         CacheConfig         `mapstructure:"cache"`
 	Observability ObservabilityConfig `mapstructure:"observability"`
-	HTTP         HTTPConfig         `mapstructure:"http"`
+	HTTP          HTTPConfig          `mapstructure:"http"`
 }
 
 // EthereumConfig holds Ethereum connection configuration
@@ -70,21 +70,166 @@ type UniswapConfig struct {
 	} `mapstructure:"rate_limit"`
 }
 
+// TradingPairConfig represents a fully parsed trading pair configuration
+type TradingPairConfig struct {
+	Name               string     // "ETH-USDC", "BTC-USDC", etc.
+	Base               TokenInfo  // Base token (ETH, BTC, etc.)
+	Quote              TokenInfo  // Quote token (USDC, USDT, etc.)
+	TradeSizes         []string   // Optional trade size override
+	MinProfitThreshold float64    // Optional min profit override
+	parsedTradeSizes   []*big.Int // Parsed trade sizes
+}
+
+// GetParsedTradeSizes returns the parsed trade sizes for this pair
+func (tpc *TradingPairConfig) GetParsedTradeSizes() []*big.Int {
+	return tpc.parsedTradeSizes
+}
+
+// PairOverride holds optional per-pair configuration overrides
+type PairOverride struct {
+	TradeSizes         []string `mapstructure:"trade_sizes"`
+	TradeSizesBase     []string `mapstructure:"trade_sizes_base"`
+	MinProfitThreshold float64  `mapstructure:"min_profit_threshold"`
+}
+
 // ArbitrageConfig holds arbitrage detection settings
 type ArbitrageConfig struct {
-	TradeSizes          []string `mapstructure:"trade_sizes"` // Wei strings
-	MinProfitThreshold  float64  `mapstructure:"min_profit_threshold"`
-	parsedTradeSizes    []*big.Int
+	// Simple list of pairs: ["ETH-USDC", "BTC-USDC"]
+	Pairs []string `mapstructure:"pairs"`
+
+	// Optional per-pair overrides
+	PairOverrides map[string]PairOverride `mapstructure:"pair_overrides"`
+
+	// Global concurrency limit for DEX quotes (across all pairs)
+	MaxConcurrentDEXQuotes int `mapstructure:"max_concurrent_dex_quotes"`
+
+	// Global defaults (renamed from old fields for backward compat)
+	DefaultTradeSizes         []string `mapstructure:"default_trade_sizes"`
+	DefaultTradeSizesBase     []string `mapstructure:"default_trade_sizes_base"`
+	DefaultMinProfitThreshold float64  `mapstructure:"default_min_profit_threshold"`
+
+	// Legacy fields (for backward compatibility)
+	TradeSizes         []string `mapstructure:"trade_sizes"`
+	MinProfitThreshold float64  `mapstructure:"min_profit_threshold"`
+
+	// Internal parsed pairs
+	parsedPairs []TradingPairConfig
 }
 
-// GetParsedTradeSizes returns the parsed trade sizes
+// Parse converts simple pair names into full TradingPairConfig with registry lookup
+func (a *ArbitrageConfig) Parse() error {
+	// Reset parsed pairs to avoid duplicates on re-parse
+	a.parsedPairs = nil
+
+	// Handle backward compatibility: if old TradeSizes exists, use it as DefaultTradeSizes
+	if len(a.DefaultTradeSizes) == 0 && len(a.TradeSizes) > 0 {
+		a.DefaultTradeSizes = a.TradeSizes
+	}
+	if a.DefaultMinProfitThreshold == 0 && a.MinProfitThreshold > 0 {
+		a.DefaultMinProfitThreshold = a.MinProfitThreshold
+	}
+
+	// Parse each pair
+	for _, pairName := range a.Pairs {
+		base, quote, err := ParsePair(pairName)
+		if err != nil {
+			return fmt.Errorf("failed to parse pair %s: %w", pairName, err)
+		}
+
+		cfg := TradingPairConfig{
+			Name:               pairName,
+			Base:               base,
+			Quote:              quote,
+			MinProfitThreshold: a.DefaultMinProfitThreshold,
+		}
+
+		selectedSizesBase := a.DefaultTradeSizesBase
+		selectedSizesRaw := a.DefaultTradeSizes
+
+		// Apply pair-specific overrides if present
+		if override, ok := a.PairOverrides[pairName]; ok {
+			if len(override.TradeSizesBase) > 0 {
+				selectedSizesBase = override.TradeSizesBase
+				selectedSizesRaw = nil
+			} else if len(override.TradeSizes) > 0 {
+				selectedSizesRaw = override.TradeSizes
+				selectedSizesBase = nil
+			}
+			if override.MinProfitThreshold > 0 {
+				cfg.MinProfitThreshold = override.MinProfitThreshold
+			}
+		}
+
+		// Parse trade sizes for this pair
+		tradeSizes := make([]*big.Int, 0)
+		if len(selectedSizesBase) > 0 {
+			cfg.TradeSizes = selectedSizesBase
+			for _, sizeStr := range selectedSizesBase {
+				size, err := parseTradeSizeBase(sizeStr, base.Decimals)
+				if err != nil {
+					return fmt.Errorf("invalid trade size base for pair %s: %w", pairName, err)
+				}
+				tradeSizes = append(tradeSizes, size)
+			}
+		} else {
+			cfg.TradeSizes = selectedSizesRaw
+			tradeSizes = make([]*big.Int, 0, len(selectedSizesRaw))
+			for _, sizeStr := range selectedSizesRaw {
+				size := new(big.Int)
+				if _, ok := size.SetString(sizeStr, 10); !ok {
+					return fmt.Errorf("invalid trade size for pair %s: %s", pairName, sizeStr)
+				}
+				tradeSizes = append(tradeSizes, size)
+			}
+		}
+		cfg.parsedTradeSizes = tradeSizes
+
+		a.parsedPairs = append(a.parsedPairs, cfg)
+	}
+
+	return nil
+}
+
+// parseTradeSizeBase converts a human-readable base size into raw units using decimals.
+func parseTradeSizeBase(sizeStr string, decimals int) (*big.Int, error) {
+	if decimals < 0 {
+		decimals = 0
+	}
+	val, _, err := big.ParseFloat(sizeStr, 10, 256, big.ToNearestEven)
+	if err != nil {
+		return nil, fmt.Errorf("invalid base trade size: %s", sizeStr)
+	}
+	if val.Sign() <= 0 {
+		return nil, fmt.Errorf("trade size must be positive: %s", sizeStr)
+	}
+	scale := new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil))
+	val.Mul(val, scale)
+	raw := new(big.Int)
+	val.Int(raw)
+	if raw.Sign() <= 0 {
+		return nil, fmt.Errorf("trade size too small after scaling: %s", sizeStr)
+	}
+	return raw, nil
+}
+
+// GetParsedPairs returns all parsed trading pair configurations
+func (a *ArbitrageConfig) GetParsedPairs() []TradingPairConfig {
+	return a.parsedPairs
+}
+
+// GetParsedTradeSizes returns the parsed trade sizes (legacy - for single pair)
+// Deprecated: Use GetParsedPairs() instead for multi-pair support
 func (ac *ArbitrageConfig) GetParsedTradeSizes() []*big.Int {
-	return ac.parsedTradeSizes
+	if len(ac.parsedPairs) > 0 {
+		return ac.parsedPairs[0].parsedTradeSizes
+	}
+	return nil
 }
 
-// GetTradeSizes returns parsed trade sizes as *big.Int
+// GetTradeSizes returns parsed trade sizes as *big.Int (legacy - for single pair)
+// Deprecated: Use GetParsedPairs() instead for multi-pair support
 func (a *ArbitrageConfig) GetTradeSizes() []*big.Int {
-	return a.parsedTradeSizes
+	return a.GetParsedTradeSizes()
 }
 
 // RedisConfig holds Redis connection configuration
@@ -208,12 +353,14 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("uniswap.pool_address", "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640")
 
 	// Arbitrage defaults
-	v.SetDefault("arbitrage.trade_sizes", []string{
-		"1000000000000000000",    // 1 ETH
-		"10000000000000000000",   // 10 ETH
-		"100000000000000000000",  // 100 ETH
+	v.SetDefault("arbitrage.pairs", []string{"ETH-USDC"}) // Default to single pair for backward compat
+	v.SetDefault("arbitrage.max_concurrent_dex_quotes", 8)
+	v.SetDefault("arbitrage.default_trade_sizes", []string{
+		"1000000000000000000",   // 1 ETH
+		"10000000000000000000",  // 10 ETH
+		"100000000000000000000", // 100 ETH
 	})
-	v.SetDefault("arbitrage.min_profit_threshold", 0.5)
+	v.SetDefault("arbitrage.default_min_profit_threshold", 0.5)
 
 	// Redis defaults
 	v.SetDefault("redis.address", "localhost:6379")
@@ -244,16 +391,10 @@ func setDefaults(v *viper.Viper) {
 
 // parse parses string values into their proper types
 func (c *Config) parse() error {
-	// Parse trade sizes from string to *big.Int
-	tradeSizes := make([]*big.Int, 0, len(c.Arbitrage.TradeSizes))
-	for _, sizeStr := range c.Arbitrage.TradeSizes {
-		size := new(big.Int)
-		if _, ok := size.SetString(sizeStr, 10); !ok {
-			return fmt.Errorf("invalid trade size: %s", sizeStr)
-		}
-		tradeSizes = append(tradeSizes, size)
+	// Parse trading pairs (converts ["ETH-USDC"] to full TradingPairConfig with registry lookup)
+	if err := c.Arbitrage.Parse(); err != nil {
+		return fmt.Errorf("failed to parse arbitrage config: %w", err)
 	}
-	c.Arbitrage.parsedTradeSizes = tradeSizes
 
 	return nil
 }
@@ -270,12 +411,20 @@ func (c *Config) Validate() error {
 	}
 
 	// Arbitrage validation
-	if len(c.Arbitrage.parsedTradeSizes) == 0 {
-		return fmt.Errorf("at least one trade size is required")
+	if len(c.Arbitrage.parsedPairs) == 0 {
+		return fmt.Errorf("at least one trading pair is required")
 	}
 
-	if c.Arbitrage.MinProfitThreshold < 0 {
-		return fmt.Errorf("min profit threshold must be >= 0")
+	for _, pair := range c.Arbitrage.parsedPairs {
+		if len(pair.parsedTradeSizes) == 0 {
+			return fmt.Errorf("at least one trade size is required for pair %s", pair.Name)
+		}
+		if pair.MinProfitThreshold < 0 {
+			return fmt.Errorf("min profit threshold must be >= 0 for pair %s", pair.Name)
+		}
+		if !pair.Quote.IsStablecoin {
+			return fmt.Errorf("quote token must be a stablecoin for accurate USD profit metrics: pair %s (quote=%s)", pair.Name, pair.Quote.Symbol)
+		}
 	}
 
 	// Redis validation

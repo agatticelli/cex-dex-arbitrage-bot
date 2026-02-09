@@ -39,7 +39,7 @@ uniswap:
   # Fee tiers to try: [100=0.01%, 500=0.05%, 3000=0.3%, 10000=1%]
   # For Infura free tier (100k req/day), use only [500, 3000] to stay under rate limits
   # For paid RPC providers (Alchemy, Infura paid), use all 4: [100, 500, 3000, 10000]
-  fee_tiers: [500, 3000]
+  fee_tiers: [500]
 
   # Rate limiting for QuoterV2 calls (to avoid hitting RPC provider limits)
   rate_limit:
@@ -48,18 +48,25 @@ uniswap:
 
 # Arbitrage detection settings
 arbitrage:
-  # Trade sizes to test (in wei)
-  # 1 ETH = 1000000000000000000 wei
-  # 10 ETH = 10000000000000000000 wei
-  # 100 ETH = 100000000000000000000 wei
-  trade_sizes:
+  # Simple list of trading pairs to monitor
+  pairs: ["ETH-USDC"]
+
+  # Optional: per-pair overrides
+  # pair_overrides:
+  #   BTC-USDC:
+  #     trade_sizes: ["10000000", "100000000"]  # 0.1 BTC, 1 BTC
+  #     min_profit_threshold: 0.5
+
+  # Global concurrency limit for DEX quotes (across all pairs)
+  max_concurrent_dex_quotes: 8
+
+  # Global defaults (used if not overridden per pair)
+  default_trade_sizes:
     - "1000000000000000000"    # 1 ETH
     - "10000000000000000000"   # 10 ETH
     - "100000000000000000000"  # 100 ETH
 
-  # Minimum profit threshold (percentage)
-  # Only opportunities above this threshold will be published
-  min_profit_threshold: 0.5  # 0.5%
+  default_min_profit_threshold: 0.5  # 0.5%
 
 # Redis configuration (for caching)
 redis:

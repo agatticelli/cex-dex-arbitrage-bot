@@ -37,8 +37,11 @@ type Opportunity struct {
 	BlockNumber    uint64     `json:"block_number"`
 	Timestamp      int64      `json:"timestamp"`
 	Direction      Direction  `json:"direction"`
-	TradeSizeWei   *big.Int   `json:"trade_size_wei"`
-	TradeSizeETH   *big.Float `json:"trade_size_eth"`
+	TradingPair    string     `json:"trading_pair"` // "ETH-USDC", "BTC-USDC", etc.
+	BaseSymbol     string     `json:"base_symbol"`
+	QuoteSymbol    string     `json:"quote_symbol"`
+	TradeSizeRaw   *big.Int   `json:"trade_size_raw"`
+	TradeSizeBase  *big.Float `json:"trade_size_base"`
 	CEXPrice       *big.Float `json:"cex_price"`
 	DEXPrice       *big.Float `json:"dex_price"`
 	PriceDiff      *big.Float `json:"price_diff"`
@@ -60,11 +63,17 @@ func NewOpportunity(blockNumber uint64, direction Direction, tradeSize *big.Int)
 		BlockNumber:    blockNumber,
 		Timestamp:      time.Now().Unix(),
 		Direction:      direction,
-		TradeSizeWei:   tradeSize,
-		TradeSizeETH:   weiToETH(tradeSize),
+		TradeSizeRaw:   tradeSize,
 		ExecutionSteps: make([]string, 0),
 		RiskFactors:    make([]string, 0),
 	}
+}
+
+// SetBaseInfo sets base/quote metadata and computes normalized trade size.
+func (o *Opportunity) SetBaseInfo(baseSymbol, quoteSymbol string, baseDecimals int) {
+	o.BaseSymbol = baseSymbol
+	o.QuoteSymbol = quoteSymbol
+	o.TradeSizeBase = rawToFloat(o.TradeSizeRaw, baseDecimals)
 }
 
 // SetPrices sets the CEX and DEX prices and calculates price differences
@@ -123,6 +132,7 @@ func (o *Opportunity) FormatOutput() string {
 	sb.WriteString(fmt.Sprintf("Opportunity ID:  %s\n", o.OpportunityID))
 	sb.WriteString(fmt.Sprintf("Block Number:    %d\n", o.BlockNumber))
 	sb.WriteString(fmt.Sprintf("Timestamp:       %s\n", time.Unix(o.Timestamp, 0).Format(time.RFC3339)))
+	sb.WriteString(fmt.Sprintf("Trading Pair:    %s\n", o.TradingPair))
 	sb.WriteString(fmt.Sprintf("Direction:       %s\n", o.Direction.String()))
 	sb.WriteString("\n")
 
@@ -130,9 +140,14 @@ func (o *Opportunity) FormatOutput() string {
 	sb.WriteString("─────────────────────────────────────────────────────────────────\n")
 	sb.WriteString("TRADE DETAILS\n")
 	sb.WriteString("─────────────────────────────────────────────────────────────────\n")
-	sb.WriteString(fmt.Sprintf("Trade Size:      %s ETH (%s wei)\n",
-		o.TradeSizeETH.Text('f', 4),
-		o.TradeSizeWei.String()))
+	baseSymbol := o.BaseSymbol
+	if baseSymbol == "" {
+		baseSymbol = "BASE"
+	}
+	sb.WriteString(fmt.Sprintf("Trade Size:      %s %s (%s raw units)\n",
+		formatBigFloat(o.TradeSizeBase, 4),
+		baseSymbol,
+		o.TradeSizeRaw.String()))
 	sb.WriteString(fmt.Sprintf("CEX Price:       $%s\n", formatBigFloat(o.CEXPrice, 2)))
 	sb.WriteString(fmt.Sprintf("DEX Price:       $%s\n", formatBigFloat(o.DEXPrice, 2)))
 	sb.WriteString(fmt.Sprintf("Price Diff:      $%s (%s%%)\n",
@@ -190,8 +205,11 @@ func (o *Opportunity) ToJSON() ([]byte, error) {
 		"block_number":     o.BlockNumber,
 		"timestamp":        o.Timestamp,
 		"direction":        o.Direction.String(),
-		"trade_size_wei":   o.TradeSizeWei.String(),
-		"trade_size_eth":   o.TradeSizeETH.Text('f', 4),
+		"trading_pair":     o.TradingPair,
+		"base_symbol":      o.BaseSymbol,
+		"quote_symbol":     o.QuoteSymbol,
+		"trade_size_raw":   o.TradeSizeRaw.String(),
+		"trade_size_base":  formatBigFloat(o.TradeSizeBase, 4),
 		"cex_price":        formatBigFloat(o.CEXPrice, 2),
 		"dex_price":        formatBigFloat(o.DEXPrice, 2),
 		"price_diff":       formatBigFloat(o.PriceDiff, 2),
@@ -209,12 +227,6 @@ func (o *Opportunity) ToJSON() ([]byte, error) {
 	return json.Marshal(data)
 }
 
-// weiToETH converts wei to ETH
-func weiToETH(wei *big.Int) *big.Float {
-	ethFloat := new(big.Float).SetInt(wei)
-	return ethFloat.Quo(ethFloat, big.NewFloat(1e18))
-}
-
 // formatBigFloat formats a big.Float for display
 func formatBigFloat(f *big.Float, precision int) string {
 	if f == nil {
@@ -230,8 +242,11 @@ type SerializableOpportunity struct {
 	BlockNumber    uint64   `json:"block_number"`
 	Timestamp      int64    `json:"timestamp"`
 	Direction      string   `json:"direction"`
-	TradeSizeWei   string   `json:"trade_size_wei"`
-	TradeSizeETH   string   `json:"trade_size_eth"`
+	TradingPair    string   `json:"trading_pair"`
+	BaseSymbol     string   `json:"base_symbol"`
+	QuoteSymbol    string   `json:"quote_symbol"`
+	TradeSizeRaw   string   `json:"trade_size_raw"`
+	TradeSizeBase  string   `json:"trade_size_base"`
 	CEXPrice       string   `json:"cex_price"`
 	DEXPrice       string   `json:"dex_price"`
 	PriceDiff      string   `json:"price_diff"`
@@ -253,8 +268,11 @@ func (o *Opportunity) ToSerializable() *SerializableOpportunity {
 		BlockNumber:    o.BlockNumber,
 		Timestamp:      o.Timestamp,
 		Direction:      o.Direction.String(),
-		TradeSizeWei:   o.TradeSizeWei.String(),
-		TradeSizeETH:   o.TradeSizeETH.Text('f', 4),
+		TradingPair:    o.TradingPair,
+		BaseSymbol:     o.BaseSymbol,
+		QuoteSymbol:    o.QuoteSymbol,
+		TradeSizeRaw:   o.TradeSizeRaw.String(),
+		TradeSizeBase:  formatBigFloat(o.TradeSizeBase, 4),
 		CEXPrice:       formatBigFloat(o.CEXPrice, 2),
 		DEXPrice:       formatBigFloat(o.DEXPrice, 2),
 		PriceDiff:      formatBigFloat(o.PriceDiff, 2),
@@ -272,12 +290,12 @@ func (o *Opportunity) ToSerializable() *SerializableOpportunity {
 
 // OpportunitySummary provides a compact summary of the opportunity
 type OpportunitySummary struct {
-	ID         string  `json:"id"`
-	Block      uint64  `json:"block"`
-	Direction  string  `json:"direction"`
-	ProfitUSD  string  `json:"profit_usd"`
-	ProfitPct  string  `json:"profit_pct"`
-	Profitable bool    `json:"profitable"`
+	ID         string `json:"id"`
+	Block      uint64 `json:"block"`
+	Direction  string `json:"direction"`
+	ProfitUSD  string `json:"profit_usd"`
+	ProfitPct  string `json:"profit_pct"`
+	Profitable bool   `json:"profitable"`
 }
 
 // ToSummary creates a compact summary of the opportunity

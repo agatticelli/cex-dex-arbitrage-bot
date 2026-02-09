@@ -1,5 +1,32 @@
 # CEX-DEX Arbitrage Bot Configuration
 # Copy this file to config.yaml and update with your settings
+#
+# ===== TOKEN REGISTRY =====
+# The system includes a built-in token registry with well-known ERC-20 tokens.
+# No need to manually specify token addresses - just use pair names like "ETH-USDC"!
+#
+# IMPORTANT: Only ETH-X pairs are supported (ETH must be the base token).
+# This is because gas costs are paid in ETH and profit calculations assume ETH as base.
+#
+# Supported pairs: ETH-USDC, ETH-USDT, ETH-DAI
+# NOT supported: BTC-USDC, USDC-ETH, etc.
+#
+# Token addresses (internal/platform/config/token_registry.go):
+#   - ETH  (WETH): 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 (18 decimals)
+#   - USDC:        0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 (6 decimals)
+#   - USDT:        0xdAC17F958D2ee523a2206206994597C13D831ec7 (6 decimals)
+#   - DAI:         0x6B175474E89094C44Da98b954EedeAC495271d0F (18 decimals)
+#
+# To add a new quote token (X in ETH-X):
+#   1. Update internal/platform/config/token_registry.go
+#   2. Add TokenInfo entry with symbol, address, decimals
+#   3. Restart the detector
+#
+# ===== GETTING STARTED =====
+# 1. Replace YOUR_INFURA_KEY and YOUR_ALCHEMY_KEY with your actual API keys
+# 2. Configure trading pairs in the 'arbitrage.pairs' section below
+# 3. Adjust rate limits based on your RPC provider plan
+# 4. For production, remove 'aws.endpoint' to use real AWS (not LocalStack)
 
 # Ethereum blockchain configuration
 ethereum:
@@ -34,13 +61,8 @@ exchanges:
 
 # Uniswap V3 configuration
 uniswap:
-  # ETH-USDC pool address on Ethereum mainnet (still used for cache key)
-  pool_address: "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"
   # QuoterV2 contract address (for accurate price quotes)
   quoter_address: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
-  # Token addresses
-  usdc_address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
-  weth_address: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
 
   # Fee tiers to try: [100=0.01%, 500=0.05%, 3000=0.3%, 10000=1%]
   # For Infura free tier (100k req/day), use only [500, 3000] to stay under rate limits
@@ -54,18 +76,56 @@ uniswap:
 
 # Arbitrage detection settings
 arbitrage:
-  # Trade sizes to test (in wei)
-  # 1 ETH = 1000000000000000000 wei
-  # 10 ETH = 10000000000000000000 wei
-  # 100 ETH = 100000000000000000000 wei
-  trade_sizes:
-    - "1000000000000000000"    # 1 ETH
+  # ===== SIMPLIFIED MULTI-PAIR CONFIGURATION =====
+  # Just list trading pairs - token addresses are handled automatically by the registry!
+  #
+  # IMPORTANT: Only ETH-X pairs are supported (ETH must be base token)
+  # Valid examples: ETH-USDC, ETH-USDT, ETH-DAI
+  # Invalid examples: BTC-USDC, USDC-ETH (will fail validation)
+  #
+  # Why ETH-only?
+  #   - Gas costs are paid in ETH on Ethereum mainnet
+  #   - Profit calculations use ethPriceUSD for gas cost conversions
+  #   - System designed specifically for WETH arbitrage
+  pairs:
+    - "ETH-USDC"
+    # - "ETH-USDT"  # Uncomment to add more ETH pairs
+    # - "ETH-DAI"   # Uncomment to add DAI pair
+
+  # Optional: Override defaults for specific pairs
+  # pair_overrides:
+  #   ETH-USDT:
+  #     trade_sizes_base:
+  #       - "0.5"                  # 0.5 ETH (human-readable)
+  #       - "2"                    # 2 ETH
+  #     min_profit_threshold: 0.3
+
+  # Global concurrency limit for DEX quotes (across all pairs)
+  max_concurrent_dex_quotes: 8
+
+  # Global defaults applied to all pairs (unless overridden above)
+  default_trade_sizes:
+    - "1000000000000000000"    # 1 ETH (18 decimals)
     - "10000000000000000000"   # 10 ETH
     - "100000000000000000000"  # 100 ETH
 
+  # Optional: Human-readable base sizes (override default_trade_sizes if set)
+  # default_trade_sizes_base:
+  #   - "1"                     # 1 ETH
+  #   - "10"                    # 10 ETH
+  #   - "100"                   # 100 ETH
+
   # Minimum profit threshold (percentage)
   # Only opportunities above this threshold will be published
-  min_profit_threshold: 0.5  # 0.5%
+  default_min_profit_threshold: 0.5  # 0.5%
+
+  # ===== LEGACY FORMAT (for backward compatibility) =====
+  # If you don't specify 'pairs', the system will use ETHUSDC with these settings
+  trade_sizes:
+    - "1000000000000000000"
+    - "10000000000000000000"
+    - "100000000000000000000"
+  min_profit_threshold: 0.5
 
 # Redis configuration (for caching)
 redis:

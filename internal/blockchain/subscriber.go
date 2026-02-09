@@ -493,10 +493,13 @@ func (s *Subscriber) backfillBlocks(ctx context.Context, startBlock, endBlock ui
 		return fmt.Errorf("client pool not configured for backfilling")
 	}
 
+	backfillStart := time.Now()
+	blocksToRecover := endBlock - startBlock + 1
+
 	s.logger.Info("backfilling missing blocks",
 		"start", startBlock,
 		"end", endBlock,
-		"count", endBlock-startBlock+1,
+		"count", blocksToRecover,
 	)
 
 	// Get client from pool
@@ -549,9 +552,17 @@ func (s *Subscriber) backfillBlocks(ctx context.Context, startBlock, endBlock ui
 		}
 	}
 
+	backfillDuration := time.Since(backfillStart)
+
 	s.logger.Info("backfill complete",
-		"blocks_recovered", endBlock-startBlock+1,
+		"blocks_recovered", blocksToRecover,
+		"duration_ms", backfillDuration.Milliseconds(),
 	)
+
+	// Record backfill metrics
+	if s.metrics != nil {
+		s.metrics.RecordBlockGapBackfill(ctx, int64(blocksToRecover), backfillDuration)
+	}
 
 	return nil
 }
