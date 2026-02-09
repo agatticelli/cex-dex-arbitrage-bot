@@ -12,14 +12,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/arbitrage"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/blockchain"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/notification"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/aws"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/cache"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/config"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/observability"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/pricing"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/arbitrage"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/blockchain"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/notification"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/aws"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/cache"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/config"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/observability"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/pricing"
 	"golang.org/x/sync/semaphore"
 )
 

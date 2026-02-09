@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/arbitrage"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/aws"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/observability"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/arbitrage"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/aws"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/observability"
 )
 
 // Publisher publishes arbitrage opportunities to SNS

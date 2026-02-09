@@ -411,6 +411,24 @@ To add a new quote token (X in ETH-X), update `internal/platform/config/token_re
 
 See `config.example.yaml` for complete configuration with comments.
 
+### Environment Overrides (for secrets)
+
+Use `ARB_` prefix and underscore-separated keys. Lists are comma-separated.
+
+Examples:
+```bash
+export ARB_ETHEREUM_WEBSOCKET_URLS="wss://mainnet.infura.io/ws/v3/KEY,wss://eth-mainnet.g.alchemy.com/v2/KEY"
+export ARB_ETHEREUM_RPC_ENDPOINTS="https://mainnet.infura.io/v3/KEY|1,https://eth-mainnet.g.alchemy.com/v2/KEY|1"
+export ARB_AWS_SNS_TOPIC_ARN="arn:aws:sns:us-east-1:123456789012:arbitrage-opportunities"
+export ARB_REDIS_PASSWORD="super-secret"
+export ARB_ARBITRAGE_TRADE_SIZES="1,10,100"
+export ARB_ARBITRAGE_PAIRS="ETH-USDC,ETH-USDT"
+```
+
+Notes:
+- RPC endpoints support optional weights using `url|weight`.
+- Values are comma-separated.
+
 **Key Settings**:
 
 **Ethereum Connection**:

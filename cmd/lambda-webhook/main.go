@@ -12,7 +12,7 @@ import (
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/arbitrage"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/arbitrage"
 )
 
 var (

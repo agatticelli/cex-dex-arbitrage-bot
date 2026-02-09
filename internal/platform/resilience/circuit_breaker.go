@@ -44,12 +44,12 @@ type CircuitBreaker struct {
 	successThreshold int
 	timeout          time.Duration
 
-	state          State
-	failures       int
-	successes      int
-	lastFailTime   time.Time
-	mu             sync.RWMutex
-	onStateChange  func(from, to State)
+	state         State
+	failures      int
+	successes     int
+	lastFailTime  time.Time
+	mu            sync.RWMutex
+	onStateChange func(from, to State)
 }
 
 // CircuitBreakerConfig holds circuit breaker configuration
@@ -153,6 +153,10 @@ func (cb *CircuitBreaker) afterRequest(err error) {
 	defer cb.mu.Unlock()
 
 	if err != nil {
+		// Ignore context cancellations/timeouts for breaker state
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
 		// Request failed
 		cb.failures++
 		cb.successes = 0

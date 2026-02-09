@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/config"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/observability"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/pricing"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/config"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/observability"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/pricing"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 )
@@ -278,6 +278,7 @@ func (d *Detector) Detect(ctx context.Context, blockNum uint64, blockTime uint64
 func (d *Detector) detectForSize(ctx context.Context, blockNum uint64, tradeSize *big.Int, gasPrice *big.Int) ([]*Opportunity, error) {
 	// Fetch prices from CEX and DEX in parallel
 	var cexBuyPrice, cexSellPrice, dexBuyPrice, dexSellPrice *pricing.Price
+	var cexBuyErr, cexSellErr, dexBuyErr, dexSellErr error
 
 	g, gctx := errgroup.WithContext(ctx)
 
@@ -287,7 +288,8 @@ func (d *Detector) detectForSize(ctx context.Context, blockNum uint64, tradeSize
 	g.Go(func() error {
 		price, err := d.cexProvider.GetPrice(gctx, tradeSize, true, nil, blockNum)
 		if err != nil {
-			return fmt.Errorf("CEX buy price: %w", err)
+			cexBuyErr = fmt.Errorf("CEX buy price: %w", err)
+			return nil
 		}
 		cexBuyPrice = price
 		return nil
@@ -299,7 +301,8 @@ func (d *Detector) detectForSize(ctx context.Context, blockNum uint64, tradeSize
 	g.Go(func() error {
 		price, err := d.cexProvider.GetPrice(gctx, tradeSize, false, nil, blockNum)
 		if err != nil {
-			return fmt.Errorf("CEX sell price: %w", err)
+			cexSellErr = fmt.Errorf("CEX sell price: %w", err)
+			return nil
 		}
 		cexSellPrice = price
 		return nil
@@ -311,13 +314,15 @@ func (d *Detector) detectForSize(ctx context.Context, blockNum uint64, tradeSize
 	g.Go(func() error {
 		if d.dexQuoteLimiter != nil {
 			if err := d.dexQuoteLimiter.Acquire(gctx, 1); err != nil {
-				return fmt.Errorf("DEX buy price limiter: %w", err)
+				dexBuyErr = fmt.Errorf("DEX buy price limiter: %w", err)
+				return nil
 			}
 			defer d.dexQuoteLimiter.Release(1)
 		}
 		price, err := d.dexProvider.GetPrice(gctx, tradeSize, true, gasPrice, blockNum)
 		if err != nil {
-			return fmt.Errorf("DEX buy price: %w", err)
+			dexBuyErr = fmt.Errorf("DEX buy price: %w", err)
+			return nil
 		}
 		dexBuyPrice = price
 		return nil
@@ -329,13 +334,15 @@ func (d *Detector) detectForSize(ctx context.Context, blockNum uint64, tradeSize
 	g.Go(func() error {
 		if d.dexQuoteLimiter != nil {
 			if err := d.dexQuoteLimiter.Acquire(gctx, 1); err != nil {
-				return fmt.Errorf("DEX sell price limiter: %w", err)
+				dexSellErr = fmt.Errorf("DEX sell price limiter: %w", err)
+				return nil
 			}
 			defer d.dexQuoteLimiter.Release(1)
 		}
 		price, err := d.dexProvider.GetPrice(gctx, tradeSize, false, gasPrice, blockNum)
 		if err != nil {
-			return fmt.Errorf("DEX sell price: %w", err)
+			dexSellErr = fmt.Errorf("DEX sell price: %w", err)
+			return nil
 		}
 		dexSellPrice = price
 		return nil
@@ -348,14 +355,33 @@ func (d *Detector) detectForSize(ctx context.Context, blockNum uint64, tradeSize
 
 	var opportunities []*Opportunity
 
+	// If we couldn't fetch DEX prices, skip (can't compute opportunity)
+	if dexBuyPrice == nil || dexSellPrice == nil {
+		if dexBuyErr != nil {
+			return nil, dexBuyErr
+		}
+		if dexSellErr != nil {
+			return nil, dexSellErr
+		}
+		return nil, fmt.Errorf("failed to fetch DEX prices")
+	}
+
 	// Analyze CEX → DEX opportunity (buy on CEX, sell on DEX)
-	if oppCEXToDEX := d.analyzeOpportunity(ctx, blockNum, tradeSize, CEXToDEX, cexBuyPrice, dexSellPrice); oppCEXToDEX != nil {
-		opportunities = append(opportunities, oppCEXToDEX)
+	if cexBuyPrice != nil {
+		if oppCEXToDEX := d.analyzeOpportunity(ctx, blockNum, tradeSize, CEXToDEX, cexBuyPrice, dexSellPrice); oppCEXToDEX != nil {
+			opportunities = append(opportunities, oppCEXToDEX)
+		}
+	} else if cexBuyErr != nil {
+		d.logger.Debug("skipping CEX->DEX due to CEX buy error", "error", cexBuyErr, "trade_size", tradeSize.String())
 	}
 
 	// Analyze DEX → CEX opportunity (buy on DEX, sell on CEX)
-	if oppDEXToCEX := d.analyzeOpportunity(ctx, blockNum, tradeSize, DEXToCEX, dexBuyPrice, cexSellPrice); oppDEXToCEX != nil {
-		opportunities = append(opportunities, oppDEXToCEX)
+	if cexSellPrice != nil {
+		if oppDEXToCEX := d.analyzeOpportunity(ctx, blockNum, tradeSize, DEXToCEX, dexBuyPrice, cexSellPrice); oppDEXToCEX != nil {
+			opportunities = append(opportunities, oppDEXToCEX)
+		}
+	} else if cexSellErr != nil {
+		d.logger.Debug("skipping DEX->CEX due to CEX sell error", "error", cexSellErr, "trade_size", tradeSize.String())
 	}
 
 	return opportunities, nil

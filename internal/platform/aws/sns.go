@@ -9,8 +9,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	"github.com/aws/aws-sdk-go-v2/service/sns/types"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/observability"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/resilience"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/observability"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/resilience"
 )
 
 // SNSClient wraps AWS SNS client with resilience patterns

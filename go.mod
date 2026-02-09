@@ -1,4 +1,4 @@
-module github.com/gatti/cex-dex-arbitrage-bot
+module github.com/agatticelli/cex-dex-arbitrage-bot
 
 go 1.24.0
 

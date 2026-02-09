@@ -12,7 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/arbitrage"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/arbitrage"
 )
 
 var (

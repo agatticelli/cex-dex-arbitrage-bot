@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/pricing"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/pricing"
 )
 
 // mockPriceProvider is a mock price provider for testing

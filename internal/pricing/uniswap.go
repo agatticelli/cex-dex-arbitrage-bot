@@ -12,9 +12,9 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/cache"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/observability"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/resilience"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/cache"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/observability"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/resilience"
 )
 
 // PoolState represents the current state of a Uniswap V3 pool

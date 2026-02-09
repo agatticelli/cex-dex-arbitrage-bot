@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"math/big"
 
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/pricing"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/pricing"
 )
 
 // Calculator calculates arbitrage profits accounting for all costs

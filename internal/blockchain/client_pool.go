@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/observability"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/observability"
 )
 
 // RPCEndpoint represents a single Ethereum RPC endpoint

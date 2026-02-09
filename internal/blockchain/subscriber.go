@@ -10,8 +10,8 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/observability"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/resilience"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/observability"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/resilience"
 )
 
 // Block represents an Ethereum block header

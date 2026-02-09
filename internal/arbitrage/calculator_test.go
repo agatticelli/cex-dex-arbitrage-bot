@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/pricing"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/pricing"
 )
 
 // TestProfitCalculationCEXToDEX tests profit calculation for CEX→DEX arbitrage

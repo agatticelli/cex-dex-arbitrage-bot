@@ -3,6 +3,9 @@ package config
 import (
 	"fmt"
 	"math/big"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/spf13/viper"
@@ -269,6 +272,8 @@ func Load(configPath string) (*Config, error) {
 	}
 
 	// Read environment variables
+	v.SetEnvPrefix("ARB")
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
 
 	// Set defaults
@@ -281,6 +286,9 @@ func Load(configPath string) (*Config, error) {
 			return nil, fmt.Errorf("failed to read config: %w", err)
 		}
 	}
+
+	// Apply environment overrides for complex types (slices/maps)
+	applyEnvOverrides(v)
 
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
@@ -354,6 +362,60 @@ func setDefaults(v *viper.Viper) {
 
 	// HTTP defaults
 	v.SetDefault("http.port", 8080)
+}
+
+func applyEnvOverrides(v *viper.Viper) {
+	if urls := os.Getenv("ARB_ETHEREUM_WEBSOCKET_URLS"); urls != "" {
+		v.Set("ethereum.websocket_urls", splitCSV(urls))
+	}
+	if endpoints := os.Getenv("ARB_ETHEREUM_RPC_ENDPOINTS"); endpoints != "" {
+		v.Set("ethereum.rpc_endpoints", parseRPCEndpoints(endpoints))
+	}
+	if pairs := os.Getenv("ARB_ARBITRAGE_PAIRS"); pairs != "" {
+		v.Set("arbitrage.pairs", splitCSV(pairs))
+	}
+	if sizes := os.Getenv("ARB_ARBITRAGE_TRADE_SIZES"); sizes != "" {
+		v.Set("arbitrage.trade_sizes", splitCSV(sizes))
+	}
+}
+
+func splitCSV(value string) []string {
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// parseRPCEndpoints parses a comma-separated list of URLs, optionally with weights.
+// Format: "url1|1,url2|2" (weight is optional, defaults to 1).
+func parseRPCEndpoints(value string) []map[string]interface{} {
+	parts := splitCSV(value)
+	out := make([]map[string]interface{}, 0, len(parts))
+	for _, p := range parts {
+		url := p
+		weight := 1
+		if strings.Contains(p, "|") {
+			segments := strings.SplitN(p, "|", 2)
+			url = strings.TrimSpace(segments[0])
+			if w, err := strconv.Atoi(strings.TrimSpace(segments[1])); err == nil && w > 0 {
+				weight = w
+			}
+		}
+		if url == "" {
+			continue
+		}
+		out = append(out, map[string]interface{}{
+			"url":    url,
+			"weight": weight,
+		})
+	}
+	return out
 }
 
 // parse parses string values into their proper types

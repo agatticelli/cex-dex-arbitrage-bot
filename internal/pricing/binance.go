@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/cache"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/observability"
-	"github.com/gatti/cex-dex-arbitrage-bot/internal/platform/resilience"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/cache"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/observability"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/resilience"
 )
 
 // Price represents a price quote for a trade
