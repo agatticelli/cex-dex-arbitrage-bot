@@ -27,9 +27,8 @@ go.work
 .env.*.local
 
 # Configuration files with secrets
-config/config.yaml
-config/*.yaml
-!config/config.example.yaml
+config.yaml
+!config.example.yaml
 
 # IDE files
 .idea/
