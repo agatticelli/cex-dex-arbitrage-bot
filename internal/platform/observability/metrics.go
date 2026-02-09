@@ -35,6 +35,9 @@ type Metrics struct {
 	DEXQuoteDuration metric.Float64Histogram
 	DEXQuoteCalls    metric.Int64Counter
 
+	// Fee tier metrics
+	FeeTierSelected metric.Int64Counter
+
 	// WebSocket metrics
 	WebSocketReconnections metric.Int64Counter
 	WebSocketConnected     metric.Int64Gauge
@@ -176,6 +179,15 @@ func (m *Metrics) initMetrics() error {
 	m.DEXQuoteCalls, err = m.meter.Int64Counter(
 		"arbitrage.dex.quote.calls",
 		metric.WithDescription("Total DEX quote calls"),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Fee tier metrics
+	m.FeeTierSelected, err = m.meter.Int64Counter(
+		"arbitrage.fee_tier.selected",
+		metric.WithDescription("Fee tier selected for best execution price"),
 	)
 	if err != nil {
 		return err
@@ -375,6 +387,13 @@ func (m *Metrics) SetCircuitBreakerState(ctx context.Context, service string, st
 // RecordError records an error
 func (m *Metrics) RecordError(ctx context.Context, errorType string) {
 	m.Errors.Add(ctx, 1, metric.WithAttributes(attribute.String("type", errorType)))
+}
+
+// RecordFeeTierUsed records when a specific fee tier is selected for best execution
+func (m *Metrics) RecordFeeTierUsed(ctx context.Context, feeTier uint32) {
+	m.FeeTierSelected.Add(ctx, 1, metric.WithAttributes(
+		attribute.Int64("fee_tier", int64(feeTier)),
+	))
 }
 
 // Handler returns the HTTP handler for Prometheus metrics

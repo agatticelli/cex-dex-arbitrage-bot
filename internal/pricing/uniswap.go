@@ -43,7 +43,7 @@ type UniswapProvider struct {
 	cache          cache.Cache
 	logger         *observability.Logger
 	metrics        *observability.Metrics
-	feePips        int // Pool fee in pips (e.g., 3000 = 0.3%)
+	feeTiers       []uint32 // Multiple fee tiers to try (e.g., [100, 500, 3000, 10000])
 }
 
 // UniswapProviderConfig holds Uniswap provider configuration
@@ -56,7 +56,7 @@ type UniswapProviderConfig struct {
 	Cache         cache.Cache
 	Logger        *observability.Logger
 	Metrics       *observability.Metrics
-	FeePips       int
+	FeeTiers      []uint32 // Multiple fee tiers to try
 }
 
 // Uniswap V3 QuoterV2 ABI (for accurate price quotes)
@@ -193,8 +193,8 @@ func NewUniswapProvider(cfg UniswapProviderConfig) (*UniswapProvider, error) {
 		return nil, fmt.Errorf("token addresses are required")
 	}
 
-	if cfg.FeePips == 0 {
-		cfg.FeePips = 3000 // Default 0.3% fee
+	if len(cfg.FeeTiers) == 0 {
+		cfg.FeeTiers = []uint32{3000} // Default 0.3% fee if not specified
 	}
 
 	// Parse addresses
@@ -221,14 +221,76 @@ func NewUniswapProvider(cfg UniswapProviderConfig) (*UniswapProvider, error) {
 		cache:          cfg.Cache,
 		logger:         cfg.Logger,
 		metrics:        cfg.Metrics,
-		feePips:        cfg.FeePips,
+		feeTiers:       cfg.FeeTiers,
 	}, nil
 }
 
-// GetPrice fetches current price from Uniswap V3 pool by simulating a swap
+// GetPrice fetches current price from Uniswap V3 pool by trying all configured fee tiers
+// and returning the best execution price
 // gasPrice is optional - if nil, will fetch from network (expensive)
 // If provided (cached from detector), uses it directly (efficient)
 func (u *UniswapProvider) GetPrice(ctx context.Context, size *big.Int, isToken0In bool, gasPrice *big.Int) (*Price, error) {
+	start := time.Now()
+
+	// Try all fee tiers and pick the best execution price
+	var bestPrice *Price
+	var bestAmountOut *big.Float // For comparison
+
+	for _, feeTier := range u.feeTiers {
+		price, err := u.getPriceForFeeTier(ctx, size, isToken0In, gasPrice, feeTier)
+		if err != nil {
+			u.logger.Warn("fee tier quote failed",
+				"fee_tier", feeTier,
+				"error", err,
+			)
+			continue // Try next tier
+		}
+
+		// Compare: pick best execution
+		// - For buying (isToken0In=true): minimize USDC spent (lower is better)
+		// - For selling (isToken0In=false): maximize USDC received (higher is better)
+		if bestPrice == nil {
+			bestPrice = price
+			bestAmountOut = price.AmountOut
+		} else {
+			betterPrice := false
+			if isToken0In {
+				// Buying: lower USDC spent is better
+				betterPrice = price.AmountOut.Cmp(bestAmountOut) < 0
+			} else {
+				// Selling: higher USDC received is better
+				betterPrice = price.AmountOut.Cmp(bestAmountOut) > 0
+			}
+
+			if betterPrice {
+				bestPrice = price
+				bestAmountOut = price.AmountOut
+			}
+		}
+	}
+
+	if bestPrice == nil {
+		return nil, fmt.Errorf("all fee tier quotes failed")
+	}
+
+	// Record metrics for fee tier selection
+	if u.metrics != nil {
+		u.metrics.RecordFeeTierUsed(ctx, bestPrice.FeeTier)
+		duration := time.Since(start)
+		u.logger.Info("selected best fee tier",
+			"fee_tier", bestPrice.FeeTier,
+			"direction", map[bool]string{true: "buy", false: "sell"}[isToken0In],
+			"price", bestPrice.Value.Text('f', 2),
+			"amountOut", bestPrice.AmountOut.Text('f', 2),
+			"duration_ms", duration.Milliseconds(),
+		)
+	}
+
+	return bestPrice, nil
+}
+
+// getPriceForFeeTier fetches price for a specific fee tier
+func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int, isToken0In bool, gasPrice *big.Int, feeTier uint32) (*Price, error) {
 	start := time.Now()
 
 	// PRODUCTION-READY: Use QuoterV2 for accurate price quotes
@@ -262,7 +324,7 @@ func (u *UniswapProvider) GetPrice(ctx context.Context, size *big.Int, isToken0I
 			TokenIn:           tokenIn,
 			TokenOut:          tokenOut,
 			Amount:            size, // Desired ETH output
-			Fee:               big.NewInt(int64(u.feePips)),
+			Fee:               big.NewInt(int64(feeTier)),
 			SqrtPriceLimitX96: big.NewInt(0),
 		}
 
@@ -288,7 +350,7 @@ func (u *UniswapProvider) GetPrice(ctx context.Context, size *big.Int, isToken0I
 			TokenIn:           tokenIn,
 			TokenOut:          tokenOut,
 			AmountIn:          size, // ETH input
-			Fee:               big.NewInt(int64(u.feePips)),
+			Fee:               big.NewInt(int64(feeTier)),
 			SqrtPriceLimitX96: big.NewInt(0),
 		}
 
@@ -364,7 +426,7 @@ func (u *UniswapProvider) GetPrice(ctx context.Context, size *big.Int, isToken0I
 	}
 
 	// Log with clear interpretation
-	feeMultiplier := float64(u.feePips) / 1000000.0
+	feeMultiplier := float64(feeTier) / 1000000.0
 	if isToken0In {
 		// Buying ETH with USDC
 		u.logger.Info("fetched Uniswap price (QuoterV2)",
@@ -416,6 +478,7 @@ func (u *UniswapProvider) GetPrice(ctx context.Context, size *big.Int, isToken0I
 		Slippage:     big.NewFloat(slippagePct / 100), // Convert to decimal
 		GasCost:      gasCost,
 		TradingFee:   big.NewFloat(feeMultiplier),
+		FeeTier:      feeTier, // Track which fee tier was used
 		Timestamp:    time.Now(),
 	}, nil
 }

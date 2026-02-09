@@ -159,7 +159,7 @@ func main() {
 		Cache:         layeredCache,
 		Logger:        logger,
 		Metrics:       metrics,
-		FeePips:       3000, // 0.3% Uniswap V3 fee
+		FeeTiers:      cfg.Uniswap.FeeTiers, // Try all configured fee tiers (100/500/3000/10000)
 	})
 	if err != nil {
 		logger.LogError(ctx, "failed to create Uniswap provider", err)

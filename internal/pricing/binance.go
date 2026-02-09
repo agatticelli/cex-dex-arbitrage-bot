@@ -23,6 +23,7 @@ type Price struct {
 	Slippage    *big.Float // Slippage percentage
 	GasCost     *big.Int   // Gas cost in wei (DEX only)
 	TradingFee  *big.Float // Trading fee percentage
+	FeeTier     uint32     // Uniswap V3 fee tier used (100/500/3000/10000 bps), 0 for CEX
 	Timestamp   time.Time
 }
 

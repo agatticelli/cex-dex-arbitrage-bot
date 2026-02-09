@@ -59,10 +59,11 @@ type RateLimitConfig struct {
 
 // UniswapConfig holds Uniswap V3 configuration
 type UniswapConfig struct {
-	QuoterAddress string `mapstructure:"quoter_address"`
-	PoolAddress   string `mapstructure:"pool_address"`
-	USDCAddress   string `mapstructure:"usdc_address"`
-	WETHAddress   string `mapstructure:"weth_address"`
+	QuoterAddress string   `mapstructure:"quoter_address"`
+	PoolAddress   string   `mapstructure:"pool_address"` // Still used for cache key
+	USDCAddress   string   `mapstructure:"usdc_address"`
+	WETHAddress   string   `mapstructure:"weth_address"`
+	FeeTiers      []uint32 `mapstructure:"fee_tiers"` // Try all standard Uniswap V3 tiers: [100, 500, 3000, 10000]
 }
 
 // ArbitrageConfig holds arbitrage detection settings
