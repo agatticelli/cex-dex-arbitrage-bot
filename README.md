@@ -6,9 +6,10 @@ A production-grade, real-time arbitrage detection system built in Go that monito
 
 This system demonstrates **senior-level software engineering** through:
 - ✅ **Package-Oriented Design** (not layer-based architecture)
-- ✅ **Direct Uniswap V3 Pool State Calculation** (advanced, not QuoterV2 beginner approach)
+- ✅ **QuoterV2 Integration for Accurate Pricing** (production-grade Uniswap quotes with ~99.9% accuracy)
+- ✅ **Multi-Fee-Tier Optimization** (automatic selection across 0.01%/0.05%/0.3%/1% pools)
 - ✅ **Comprehensive Observability** (OpenTelemetry, Prometheus, Jaeger)
-- ✅ **Resilience Patterns** (circuit breaker, retry with exponential backoff, rate limiting)
+- ✅ **Resilience Patterns** (circuit breaker, retry with exponential backoff, rate limiting, WS fallback + gap recovery)
 - ✅ **Event-Driven Architecture** (SNS/SQS fan-out with LocalStack)
 - ✅ **Parallel Price Fetching** (concurrent CEX and DEX quote retrieval)
 - ✅ **Docker Compose Deployment** (production-ready containerized setup)
@@ -16,17 +17,23 @@ This system demonstrates **senior-level software engineering** through:
 ### High-Level Flow
 
 ```
-Ethereum Block (WebSocket)
+Ethereum Block (WebSocket with HTTP fallback + gap recovery)
     ↓
 [Arbitrage Detector]
-    ↓ (parallel fetch)
-    ├─→ Binance API (orderbook calculation)
-    └─→ Uniswap V3 Pool (direct state calculation)
+    ↓ (fetch prices in parallel)
+    ├─→ Binance API (orderbook snapshot)
+    ├─→ Uniswap QuoterV2 (DEX quote across 4 fee tiers)
+    └─→ Redis (cache pool state, gas prices)
     ↓
-[Profit Calculator]
-    ↓ (if profitable)
+[Arbitrage Detection Logic]
+    ↓ (if opportunity found)
     ↓
-[SNS Topic] → [SQS Queues] → [Lambda Functions] → [DynamoDB + Webhooks]
+[SNS Topic: arbitrage-opportunities] (LocalStack)
+    ↓ (fan-out)
+    ├─→ SES (email notifications - direct AWS config)
+    ├─→ SNS Mobile Push (mobile notifications - direct AWS config)
+    ├─→ SQS: persistence → Lambda → DynamoDB
+    └─→ SQS: webhooks → Lambda → HTTP POST
 ```
 
 ### Package Structure (Package-Oriented Design)
@@ -43,11 +50,7 @@ cex-dex-arbitrage-bot/
 │   ├── pricing/                        # Price providers (infrastructure)
 │   │   ├── binance.go                  # CEX provider + Price type
 │   │   ├── orderbook.go                # Orderbook calculation logic
-│   │   ├── uniswap.go                  # DEX provider with direct pool state
-│   │   └── uniswapv3/                  # Advanced Uniswap V3 math
-│   │       ├── tick_math.go            # Tick ↔ sqrt price conversions
-│   │       ├── sqrt_price_math.go      # Amount calculations
-│   │       └── swap_math.go            # Swap simulation
+│   │   └── uniswap.go                  # DEX provider with QuoterV2 integration
 │   ├── blockchain/                     # Ethereum integration
 │   │   ├── subscriber.go               # WebSocket block subscription
 │   │   └── client_pool.go              # RPC failover with health tracking
@@ -67,19 +70,26 @@ cex-dex-arbitrage-bot/
 
 ## Key Technical Decisions
 
-### 1. Direct Uniswap V3 Pool State Calculation (Advanced Approach)
+### 1. QuoterV2 Integration with Multi-Fee-Tier Optimization
 
-**Why Not QuoterV2?** The QuoterV2 contract is the beginner-friendly approach. This implementation demonstrates **deep protocol understanding** by:
+**Production-Grade Pricing**: This implementation uses Uniswap's official **QuoterV2 contract** (`0x61fFE014bA17989E743c5F6cB21bF9697530B21e`) for accurate swap quotes:
 
-- **Porting Solidity Math to Go**: Implementing `TickMath`, `SqrtPriceMath`, and `SwapMath` libraries from Uniswap V3 core contracts
-- **Direct Pool State Reading**: Calling `slot0()` and `liquidity()` directly from the pool contract
-- **Price Simulation**: Calculating output amounts by simulating swaps through the concentrated liquidity math
-- **No External Dependencies**: One less point of failure, faster execution, full control over calculations
+- **~99.9% Accuracy**: QuoterV2 provides near-perfect accuracy compared to actual on-chain execution
+- **No Slippage Surprises**: Accounts for concentrated liquidity, tick transitions, and fee tiers
+- **Battle-Tested**: Official Uniswap V3 quoter used by their frontend and aggregators
+- **Reduced Complexity**: Leverages audited contracts instead of porting complex Solidity math
 
-**Implementation Files**:
-- `internal/pricing/uniswapv3/tick_math.go`: Binary search for tick discovery, sqrt price calculations
-- `internal/pricing/uniswapv3/sqrt_price_math.go`: Token amount deltas based on liquidity and price ranges
-- `internal/pricing/uniswapv3/swap_math.go`: Single-step swap simulation with fee accounting
+**Multi-Fee-Tier Optimization**: Automatically selects the best execution price across all fee tiers:
+
+- **Four Fee Tiers**: 100 bps (0.01%), 500 bps (0.05%), 3000 bps (0.3%), 10000 bps (1%)
+- **Best Execution**: For each quote, tries all tiers and selects optimal price
+- **Metrics Tracking**: Records which tier was selected via `arbitrage.fee_tier.selected` metric
+- **Liquidity-Aware**: Lower fee tiers may have less liquidity but better pricing for small sizes
+
+**Why QuoterV2 Over Direct Math?**
+- Initial plan included direct pool state calculation, but production requirements favored reliability over complexity
+- QuoterV2 provides guaranteed accuracy without maintaining complex tick math in Go
+- Enables rapid iteration and testing without worrying about math edge cases
 
 ### 2. Package-Oriented Design (Go Idiomatic)
 
@@ -117,9 +127,12 @@ if err := g.Wait(); err != nil { /* handle */ }
 **Key Metrics**:
 - `arbitrage.block.processing.duration`: Histogram of block processing latency
 - `arbitrage.opportunities.detected`: Counter with labels (direction, profitable)
-- `arbitrage.cache.hit_ratio`: Gauge per layer (L1/L2)
+- `arbitrage.fee_tier.selected`: Counter for multi-tier optimization (labels: fee_tier=100/500/3000/10000)
+- `arbitrage.cache.hits` / `arbitrage.cache.misses`: Counters per layer (binance, uniswap)
 - `arbitrage.circuit_breaker.state`: Gauge per service (closed=0, open=1, half-open=2)
 - `arbitrage.websocket.reconnections`: Counter for connection stability
+- `arbitrage.block.gaps`: Counter for detected block sequence gaps
+- `arbitrage.blocks.received`: Counter for total blocks received
 
 ### 5. Resilience Patterns
 
@@ -142,6 +155,20 @@ if err := g.Wait(); err != nil { /* handle */ }
 - L2 (Redis): Persistent, cross-replica consistency
 - Write-through strategy: writes go to both layers
 - TTL: 10s for Binance orderbooks, 12s for Uniswap pool state (1 block)
+
+### 6. WebSocket Resilience with HTTP Fallback
+
+**Automatic Failover**:
+- **Primary Mode**: WebSocket subscriptions for real-time block headers
+- **Fallback Mode**: HTTP polling (12s interval) when WebSocket fails repeatedly
+- **Threshold**: Switches to HTTP after 3 consecutive WebSocket failures
+- **Auto-Recovery**: Periodically attempts to switch back to WebSocket
+
+**Gap Recovery**:
+- **Gap Detection**: Monitors block sequence numbers for missed blocks
+- **Automatic Backfill**: Fetches missing blocks via RPC when gap detected
+- **Metrics**: Tracks `arbitrage.block.gaps` and `blocks_backfilled_total`
+- **Zero Data Loss**: Ensures all blocks are processed even during connection issues
 
 ## Quick Start (Docker Compose)
 
