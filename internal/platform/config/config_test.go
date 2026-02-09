@@ -2,11 +2,11 @@ package config
 
 import "testing"
 
-func TestArbitrageConfig_Parse_TradeSizesBase_Default(t *testing.T) {
+func TestArbitrageConfig_Parse_TradeSizes_Default(t *testing.T) {
 	cfg := ArbitrageConfig{
-		Pairs:                     []string{"ETH-USDC"},
-		DefaultTradeSizesBase:     []string{"1.5", "0.1"},
-		DefaultMinProfitThreshold: 0.5,
+		Pairs:              []string{"ETH-USDC"},
+		TradeSizes:         []string{"1.5", "0.1"},
+		MinProfitThreshold: 0.5,
 	}
 
 	if err := cfg.Parse(); err != nil {
@@ -30,14 +30,14 @@ func TestArbitrageConfig_Parse_TradeSizesBase_Default(t *testing.T) {
 	}
 }
 
-func TestArbitrageConfig_Parse_TradeSizesBase_Override(t *testing.T) {
+func TestArbitrageConfig_Parse_TradeSizes_Override(t *testing.T) {
 	cfg := ArbitrageConfig{
-		Pairs:                     []string{"ETH-USDC", "ETH-USDT"},
-		DefaultTradeSizes:         []string{"1000000000000000000"}, // 1 ETH raw
-		DefaultMinProfitThreshold: 0.5,
+		Pairs:              []string{"ETH-USDC", "ETH-USDT"},
+		TradeSizes:         []string{"1"}, // 1 ETH
+		MinProfitThreshold: 0.5,
 		PairOverrides: map[string]PairOverride{
 			"ETH-USDT": {
-				TradeSizesBase: []string{"0.25"},
+				TradeSizes: []string{"0.25"},
 			},
 		},
 	}
@@ -67,5 +67,15 @@ func TestArbitrageConfig_Parse_TradeSizesBase_Override(t *testing.T) {
 
 	if got := overridePair.parsedTradeSizes[0].String(); got != "250000000000000000" {
 		t.Errorf("trade size base 0.25 ETH: expected 250000000000000000, got %s", got)
+	}
+}
+
+func TestArbitrageConfig_Parse_TradeSizes_Missing(t *testing.T) {
+	cfg := ArbitrageConfig{
+		Pairs: []string{"ETH-USDC"},
+	}
+
+	if err := cfg.Parse(); err == nil {
+		t.Fatal("expected error for missing trade_sizes, got nil")
 	}
 }

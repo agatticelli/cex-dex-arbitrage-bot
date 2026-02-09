@@ -95,7 +95,7 @@ arbitrage:
   # Optional: Override defaults for specific pairs
   # pair_overrides:
   #   ETH-USDT:
-  #     trade_sizes_base:
+  #     trade_sizes:
   #       - "0.5"                  # 0.5 ETH (human-readable)
   #       - "2"                    # 2 ETH
   #     min_profit_threshold: 0.3
@@ -103,29 +103,15 @@ arbitrage:
   # Global concurrency limit for DEX quotes (across all pairs)
   max_concurrent_dex_quotes: 8
 
-  # Global defaults applied to all pairs (unless overridden above)
-  default_trade_sizes:
-    - "1000000000000000000"    # 1 ETH (18 decimals)
-    - "10000000000000000000"   # 10 ETH
-    - "100000000000000000000"  # 100 ETH
-
-  # Optional: Human-readable base sizes (override default_trade_sizes if set)
-  # default_trade_sizes_base:
-  #   - "1"                     # 1 ETH
-  #   - "10"                    # 10 ETH
-  #   - "100"                   # 100 ETH
+  # Trade sizes (human-readable base units)
+  trade_sizes:
+    - "1"                     # 1 ETH
+    - "10"                    # 10 ETH
+    - "100"                   # 100 ETH
 
   # Minimum profit threshold (percentage)
   # Only opportunities above this threshold will be published
-  default_min_profit_threshold: 0.5  # 0.5%
-
-  # ===== LEGACY FORMAT (for backward compatibility) =====
-  # If you don't specify 'pairs', the system will use ETHUSDC with these settings
-  trade_sizes:
-    - "1000000000000000000"
-    - "10000000000000000000"
-    - "100000000000000000000"
-  min_profit_threshold: 0.5
+  min_profit_threshold: 0.5  # 0.5%
 
 # Redis configuration (for caching)
 redis:

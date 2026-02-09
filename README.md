@@ -84,7 +84,7 @@ arbitrage:
   # Optional: per-pair overrides
   pair_overrides:
     ETH-USDT:
-      trade_sizes: ["500000000000000000", "2000000000000000000"]  # 0.5 ETH, 2 ETH
+      trade_sizes: ["0.5", "2"]  # 0.5 ETH, 2 ETH (human-readable)
       min_profit_threshold: 0.3
 ```
 
@@ -386,14 +386,14 @@ arbitrage:
   # Optional: override defaults for specific pairs
   pair_overrides:
     ETH-USDT:
-      trade_sizes: ["500000000000000000", "2000000000000000000"]  # 0.5 ETH, 2 ETH
+      trade_sizes: ["0.5", "2"]  # 0.5 ETH, 2 ETH (human-readable)
       min_profit_threshold: 0.3  # 0.3% minimum profit
 
-  # Global defaults applied to all pairs
-  default_trade_sizes:
-    - "1000000000000000000"   # 1 ETH
-    - "10000000000000000000"  # 10 ETH
-  default_min_profit_threshold: 0.5
+  # Global trade sizes (human-readable base units)
+  trade_sizes:
+    - "1"    # 1 ETH
+    - "10"   # 10 ETH
+  min_profit_threshold: 0.5
 ```
 
 ### Token Registry
@@ -420,9 +420,9 @@ See `config.example.yaml` for complete configuration with comments.
 - `ethereum.gas_price_cache_ttl`: How long to cache gas prices (default: 12s)
 
 **Arbitrage Detection**:
-- `arbitrage.pairs`: List of trading pairs (e.g., `["ETH-USDC", "BTC-USDC"]`)
-- `arbitrage.default_trade_sizes`: Trade sizes in wei (1 ETH = 1000000000000000000)
-- `arbitrage.default_min_profit_threshold`: Minimum profit % (0.5 = 0.5%)
+- `arbitrage.pairs`: List of trading pairs (e.g., `["ETH-USDC", "ETH-USDT"]`)
+- `arbitrage.trade_sizes`: Trade sizes in base units (human-readable)
+- `arbitrage.min_profit_threshold`: Minimum profit % (0.5 = 0.5%)
 - `arbitrage.pair_overrides`: Per-pair custom settings
 
 **Uniswap V3 Settings**:

@@ -88,7 +88,6 @@ func (tpc *TradingPairConfig) GetParsedTradeSizes() []*big.Int {
 // PairOverride holds optional per-pair configuration overrides
 type PairOverride struct {
 	TradeSizes         []string `mapstructure:"trade_sizes"`
-	TradeSizesBase     []string `mapstructure:"trade_sizes_base"`
 	MinProfitThreshold float64  `mapstructure:"min_profit_threshold"`
 }
 
@@ -103,12 +102,7 @@ type ArbitrageConfig struct {
 	// Global concurrency limit for DEX quotes (across all pairs)
 	MaxConcurrentDEXQuotes int `mapstructure:"max_concurrent_dex_quotes"`
 
-	// Global defaults (renamed from old fields for backward compat)
-	DefaultTradeSizes         []string `mapstructure:"default_trade_sizes"`
-	DefaultTradeSizesBase     []string `mapstructure:"default_trade_sizes_base"`
-	DefaultMinProfitThreshold float64  `mapstructure:"default_min_profit_threshold"`
-
-	// Legacy fields (for backward compatibility)
+	// Global settings
 	TradeSizes         []string `mapstructure:"trade_sizes"`
 	MinProfitThreshold float64  `mapstructure:"min_profit_threshold"`
 
@@ -121,12 +115,8 @@ func (a *ArbitrageConfig) Parse() error {
 	// Reset parsed pairs to avoid duplicates on re-parse
 	a.parsedPairs = nil
 
-	// Handle backward compatibility: if old TradeSizes exists, use it as DefaultTradeSizes
-	if len(a.DefaultTradeSizes) == 0 && len(a.TradeSizes) > 0 {
-		a.DefaultTradeSizes = a.TradeSizes
-	}
-	if a.DefaultMinProfitThreshold == 0 && a.MinProfitThreshold > 0 {
-		a.DefaultMinProfitThreshold = a.MinProfitThreshold
+	if len(a.TradeSizes) == 0 {
+		return fmt.Errorf("arbitrage.trade_sizes is required (human-readable base sizes)")
 	}
 
 	// Parse each pair
@@ -140,20 +130,14 @@ func (a *ArbitrageConfig) Parse() error {
 			Name:               pairName,
 			Base:               base,
 			Quote:              quote,
-			MinProfitThreshold: a.DefaultMinProfitThreshold,
+			TradeSizes:         a.TradeSizes,
+			MinProfitThreshold: a.MinProfitThreshold,
 		}
-
-		selectedSizesBase := a.DefaultTradeSizesBase
-		selectedSizesRaw := a.DefaultTradeSizes
 
 		// Apply pair-specific overrides if present
 		if override, ok := a.PairOverrides[pairName]; ok {
-			if len(override.TradeSizesBase) > 0 {
-				selectedSizesBase = override.TradeSizesBase
-				selectedSizesRaw = nil
-			} else if len(override.TradeSizes) > 0 {
-				selectedSizesRaw = override.TradeSizes
-				selectedSizesBase = nil
+			if len(override.TradeSizes) > 0 {
+				cfg.TradeSizes = override.TradeSizes
 			}
 			if override.MinProfitThreshold > 0 {
 				cfg.MinProfitThreshold = override.MinProfitThreshold
@@ -161,26 +145,13 @@ func (a *ArbitrageConfig) Parse() error {
 		}
 
 		// Parse trade sizes for this pair
-		tradeSizes := make([]*big.Int, 0)
-		if len(selectedSizesBase) > 0 {
-			cfg.TradeSizes = selectedSizesBase
-			for _, sizeStr := range selectedSizesBase {
-				size, err := parseTradeSizeBase(sizeStr, base.Decimals)
-				if err != nil {
-					return fmt.Errorf("invalid trade size base for pair %s: %w", pairName, err)
-				}
-				tradeSizes = append(tradeSizes, size)
+		tradeSizes := make([]*big.Int, 0, len(cfg.TradeSizes))
+		for _, sizeStr := range cfg.TradeSizes {
+			size, err := parseTradeSizeBase(sizeStr, base.Decimals)
+			if err != nil {
+				return fmt.Errorf("invalid trade size for pair %s: %w", pairName, err)
 			}
-		} else {
-			cfg.TradeSizes = selectedSizesRaw
-			tradeSizes = make([]*big.Int, 0, len(selectedSizesRaw))
-			for _, sizeStr := range selectedSizesRaw {
-				size := new(big.Int)
-				if _, ok := size.SetString(sizeStr, 10); !ok {
-					return fmt.Errorf("invalid trade size for pair %s: %s", pairName, sizeStr)
-				}
-				tradeSizes = append(tradeSizes, size)
-			}
+			tradeSizes = append(tradeSizes, size)
 		}
 		cfg.parsedTradeSizes = tradeSizes
 
@@ -355,12 +326,8 @@ func setDefaults(v *viper.Viper) {
 	// Arbitrage defaults
 	v.SetDefault("arbitrage.pairs", []string{"ETH-USDC"}) // Default to single pair for backward compat
 	v.SetDefault("arbitrage.max_concurrent_dex_quotes", 8)
-	v.SetDefault("arbitrage.default_trade_sizes", []string{
-		"1000000000000000000",   // 1 ETH
-		"10000000000000000000",  // 10 ETH
-		"100000000000000000000", // 100 ETH
-	})
-	v.SetDefault("arbitrage.default_min_profit_threshold", 0.5)
+	v.SetDefault("arbitrage.trade_sizes", []string{"1", "10", "100"})
+	v.SetDefault("arbitrage.min_profit_threshold", 0.5)
 
 	// Redis defaults
 	v.SetDefault("redis.address", "localhost:6379")
