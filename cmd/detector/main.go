@@ -211,6 +211,7 @@ func main() {
 		Logger:          logger,
 		Metrics:         metrics,
 		ReconnectConfig: blockchain.DefaultReconnectConfig(),
+		ClientPool:      clientPool, // NEW: for HTTP RPC fallback
 	})
 	if err != nil {
 		logger.LogError(ctx, "failed to create subscriber", err)
