@@ -321,6 +321,18 @@ func main() {
 
 	logger.Info("all detectors created", "count", len(detectors))
 
+	// Warm up caches before starting block processing
+	logger.Info("warming caches...")
+	warmer := cache.NewWarmer(logger, cache.DefaultWarmupConfig())
+	warmer.RegisterProvider(binanceProvider)
+	for _, provider := range dexProviders {
+		warmer.RegisterProvider(provider)
+	}
+	warmupResults := warmer.Warmup(ctx)
+	if warmupResults.HasErrors() {
+		logger.LogWarn(ctx, fmt.Sprintf("cache warmup completed with %d errors", warmupResults.Errors))
+	}
+
 	// Create block subscriber
 	logger.Info("creating block subscriber...")
 	subscriber, err := blockchain.NewSubscriber(blockchain.SubscriberConfig{
@@ -337,7 +349,7 @@ func main() {
 
 	// Start HTTP server for health checks and metrics
 	logger.Info("starting HTTP server...")
-	go startHTTPServer(cfg.HTTP.Port, metrics, logger, clientPool, binanceProvider, dexProviders)
+	httpServer := startHTTPServer(cfg.HTTP.Port, metrics, logger, clientPool, binanceProvider, dexProviders)
 
 	// Setup signal handling
 	sigCh := make(chan os.Signal, 1)
@@ -356,8 +368,24 @@ func main() {
 	<-sigCh
 	logger.Info("shutdown signal received, gracefully stopping...")
 
-	// Graceful shutdown
+	// Graceful shutdown with timeout
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+
+	// Shutdown HTTP server first (stop accepting new requests)
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		logger.LogError(shutdownCtx, "HTTP server shutdown error", err)
+	} else {
+		logger.Info("HTTP server stopped gracefully")
+	}
+
+	// Close block subscriber
 	subscriber.Close()
+	logger.Info("block subscriber closed")
+
+	// Cancel context to stop detector goroutines
+	cancel()
+
 	logger.Info("application stopped")
 }
 
@@ -454,7 +482,8 @@ func runDetector(
 }
 
 // startHTTPServer starts HTTP server for health checks and metrics
-func startHTTPServer(port int, metrics *observability.Metrics, logger *observability.Logger, clientPool *blockchain.ClientPool, binanceProvider *pricing.BinanceProvider, dexProviders map[string]*pricing.UniswapProvider) {
+// Returns the server instance for graceful shutdown
+func startHTTPServer(port int, metrics *observability.Metrics, logger *observability.Logger, clientPool *blockchain.ClientPool, binanceProvider *pricing.BinanceProvider, dexProviders map[string]*pricing.UniswapProvider) *http.Server {
 	mux := http.NewServeMux()
 
 	type providerHealthResponse struct {
@@ -628,7 +657,12 @@ func startHTTPServer(port int, metrics *observability.Metrics, logger *observabi
 		Handler: mux,
 	}
 
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		logger.LogError(context.Background(), "HTTP server error", err)
-	}
+	// Start server in goroutine
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.LogError(context.Background(), "HTTP server error", err)
+		}
+	}()
+
+	return server
 }

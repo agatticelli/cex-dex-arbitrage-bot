@@ -240,9 +240,9 @@ type LoggingConfig struct {
 }
 
 // MetricsConfig holds metrics settings
+// Note: Metrics are exposed on the main HTTP server port (http.port), not a separate port
 type MetricsConfig struct {
 	Enabled bool `mapstructure:"enabled"`
-	Port    int  `mapstructure:"port"`
 }
 
 // TracingConfig holds tracing settings
@@ -355,7 +355,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("observability.logging.level", "info")
 	v.SetDefault("observability.logging.format", "json")
 	v.SetDefault("observability.metrics.enabled", true)
-	v.SetDefault("observability.metrics.port", 9091)
+	// Note: metrics exposed on http.port, no separate metrics port
 	v.SetDefault("observability.tracing.enabled", true)
 	v.SetDefault("observability.tracing.endpoint", "localhost:4317")
 	v.SetDefault("observability.tracing.sampler", "always")

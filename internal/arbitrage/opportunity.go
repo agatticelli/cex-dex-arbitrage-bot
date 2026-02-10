@@ -187,7 +187,7 @@ func (o *Opportunity) FormatOutput() string {
 		sb.WriteString("RISK FACTORS\n")
 		sb.WriteString("─────────────────────────────────────────────────────────────────\n")
 		for _, risk := range o.RiskFactors {
-			sb.WriteString(fmt.Sprintf("⚠  %s\n", risk))
+			sb.WriteString(fmt.Sprintf("[!] %s\n", risk))
 		}
 		sb.WriteString("\n")
 	}

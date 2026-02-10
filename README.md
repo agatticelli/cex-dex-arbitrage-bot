@@ -17,7 +17,49 @@ This system demonstrates **senior-level software engineering** through:
 - ✅ **Parallel Price Fetching** (concurrent CEX and DEX quote retrieval)
 - ✅ **Docker Compose Deployment** (production-ready containerized setup)
 
-### High-Level Flow
+> **Note**: Performance metrics (cache hit ratios, RPC reduction percentages, latencies) are estimated values based on typical usage patterns under normal conditions. Actual results may vary depending on network conditions, RPC provider, and market activity.
+
+### System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          CEX-DEX Arbitrage Detector                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐         │
+│  │   Block Event   │    │   Arbitrage     │    │   Notification  │         │
+│  │   Subscriber    │───▶│   Detector      │───▶│   Publisher     │         │
+│  │   (WebSocket)   │    │   (per pair)    │    │   (SNS)         │         │
+│  └─────────────────┘    └─────────────────┘    └─────────────────┘         │
+│          │                      │                      │                    │
+│          │              ┌───────┴───────┐              │                    │
+│          │              ▼               ▼              ▼                    │
+│          │       ┌───────────┐   ┌───────────┐   ┌───────────┐             │
+│          │       │  Binance  │   │  Uniswap  │   │  AWS SNS  │             │
+│          │       │  Provider │   │  Provider │   │  Topic    │             │
+│          │       │  (CEX)    │   │  (DEX)    │   │           │             │
+│          │       └───────────┘   └───────────┘   └───────────┘             │
+│          │              │               │              │                    │
+│          ▼              ▼               ▼              ▼                    │
+│  ┌─────────────────────────────────────────────────────────────────┐       │
+│  │                    Platform Layer                                │       │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌────────┐│       │
+│  │  │ Cache   │  │ Metrics │  │ Tracing │  │ Circuit │  │  Rate  ││       │
+│  │  │ L1+L2   │  │ Prom    │  │ Jaeger  │  │ Breaker │  │Limiter ││       │
+│  │  └─────────┘  └─────────┘  └─────────┘  └─────────┘  └────────┘│       │
+│  └─────────────────────────────────────────────────────────────────┘       │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                     │
+                    ┌────────────────┴────────────────┐
+                    ▼                                 ▼
+            ┌─────────────┐                   ┌─────────────┐
+            │   Redis     │                   │  Ethereum   │
+            │   (L2 Cache)│                   │  RPC Pool   │
+            └─────────────┘                   └─────────────┘
+```
+
+### Data Flow
 
 ```
 Ethereum Block (WebSocket with HTTP fallback + gap recovery)
@@ -267,7 +309,7 @@ if err := g.Wait(); err != nil { /* handle */ }
 - L1 (in-memory LRU): Sub-millisecond latency for hot data (pool state, gas prices)
 - L2 (Redis): Persistent, cross-replica consistency
 - Write-through strategy: writes go to both layers
-- TTL: 10s for Binance orderbooks, 12s for Uniswap pool state (1 block)
+- TTL: 10s for Binance orderbooks, 15s for Uniswap DEX quotes (~1.25 blocks)
 
 ### 6. WebSocket Resilience with HTTP Fallback
 
@@ -460,8 +502,7 @@ Notes:
 - `cache.default_ttl`: Default cache TTL in seconds
 
 **Observability**:
-- `observability.metrics.enabled`: Enable Prometheus metrics
-- `observability.metrics.port`: Metrics HTTP server port (default: 8080)
+- `observability.metrics.enabled`: Enable Prometheus metrics (exposed on HTTP server port)
 - `observability.tracing.enabled`: Enable Jaeger tracing
 - `observability.tracing.endpoint`: OTLP gRPC endpoint
 
@@ -477,24 +518,24 @@ Notes:
 **Endpoint**: http://localhost:8080/metrics (also scraped by Prometheus at :9090)
 
 ```prometheus
-# Block processing
-arbitrage_block_processing_duration_seconds_bucket{le="1"}
+# Block processing (durations in milliseconds)
+arbitrage_block_processing_duration_ms_bucket{le="1000"}
 arbitrage_blocks_processed_total
 arbitrage_blocks_received_total
 arbitrage_block_gaps_total
 arbitrage_block_gap_backfill_total
-arbitrage_block_gap_backfill_duration_seconds_bucket{le="0.5"}
+arbitrage_block_gap_backfill_duration_ms_bucket{le="500"}
 
 # Opportunities (multi-pair support)
 arbitrage_opportunities_detected_total{pair="ETH-USDC",direction="CEX_TO_DEX",profitable="true"}
-arbitrage_opportunities_detected_total{pair="BTC-USDC",direction="DEX_TO_CEX",profitable="false"}
+arbitrage_opportunities_detected_total{pair="ETH-USDT",direction="DEX_TO_CEX",profitable="false"}
 arbitrage_opportunities_profit_usd_bucket{pair="ETH-USDC",direction="CEX_TO_DEX",le="100"}
 
-# QuoterV2 & DEX Performance
+# QuoterV2 & DEX Performance (durations in milliseconds)
 arbitrage_quoter_calls_total{fee_tier="500",status="success"}
 arbitrage_quoter_calls_total{fee_tier="3000",status="error"}
-arbitrage_quoter_duration_seconds{fee_tier="500",status="success"}
-arbitrage_dex_quote_duration_seconds{dex="uniswapv3",success="true"}
+arbitrage_quoter_duration_ms{fee_tier="500",status="success"}
+arbitrage_dex_quote_duration_ms{dex="uniswapv3",success="true"}
 arbitrage_fee_tier_selected_total{fee_tier="500"}
 
 # Cache Performance
@@ -503,9 +544,9 @@ arbitrage_quote_cache_requests_total{provider="uniswap",layer="L1",status="miss"
 arbitrage_cache_hits_total{layer="L1"}
 arbitrage_cache_misses_total{layer="L2"}
 
-# CEX API Performance
+# CEX API Performance (durations in milliseconds)
 arbitrage_cex_api_calls_total{exchange="binance",endpoint="orderbook",status="success"}
-arbitrage_cex_api_duration_seconds{exchange="binance",endpoint="orderbook",status="success"}
+arbitrage_cex_api_duration_ms{exchange="binance",endpoint="orderbook",status="success"}
 
 # Live Pricing
 arbitrage_eth_price_usd{} 2126.81
@@ -535,8 +576,8 @@ rate(arbitrage_block_gaps_total[5m]) > 0.1
 # Opportunities by pair (show all pairs)
 sum by (pair) (arbitrage_opportunities_detected_total{profitable="true"})
 
-# Average block processing time
-histogram_quantile(0.99, rate(arbitrage_block_processing_duration_seconds_bucket[5m]))
+# Average block processing time (99th percentile in ms)
+histogram_quantile(0.99, rate(arbitrage_block_processing_duration_ms_bucket[5m]))
 ```
 
 ### Distributed Tracing

@@ -381,6 +381,35 @@ func (b *BinanceProvider) recordHealth(err error, duration time.Duration) {
 }
 
 // parseOrderbook converts Binance API response to Orderbook
+// Name returns the provider name for warmup logging.
+func (b *BinanceProvider) Name() string {
+	return "binance"
+}
+
+// Warmup pre-populates the cache with initial orderbook data.
+// This implements the cache.WarmupProvider interface.
+func (b *BinanceProvider) Warmup(ctx context.Context) error {
+	// Warm up ETHUSDC orderbook (used for ETH price and trading)
+	_, err := b.GetOrderbook(ctx, "ETHUSDC", 100)
+	if err != nil {
+		return fmt.Errorf("failed to warm ETHUSDC orderbook: %w", err)
+	}
+
+	b.logger.Info("Binance cache warmed successfully", "symbol", "ETHUSDC")
+	return nil
+}
+
+// WarmupSymbols pre-populates the cache with orderbooks for multiple symbols.
+func (b *BinanceProvider) WarmupSymbols(ctx context.Context, symbols []string) error {
+	for _, symbol := range symbols {
+		if _, err := b.GetOrderbook(ctx, symbol, 100); err != nil {
+			b.logger.Warn("failed to warm orderbook", "symbol", symbol, "error", err)
+			// Continue with other symbols
+		}
+	}
+	return nil
+}
+
 func (b *BinanceProvider) parseOrderbook(apiResp *BinanceOrderbookResponse) (*Orderbook, error) {
 	orderbook := &Orderbook{
 		Bids:      make([]OrderbookLevel, 0, len(apiResp.Bids)),

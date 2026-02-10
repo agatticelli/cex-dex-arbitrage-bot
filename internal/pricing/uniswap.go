@@ -8,13 +8,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/cache"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/observability"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/resilience"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/cache"
-	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/observability"
-	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/resilience"
 )
 
 // PoolState represents the current state of a Uniswap V3 pool
@@ -218,12 +218,12 @@ func NewUniswapProvider(cfg UniswapProviderConfig) (*UniswapProvider, error) {
 		cfg.FeeTiers = []uint32{3000} // Default 0.3% fee if not specified
 	}
 
-	// Set rate limit defaults
+	// Set rate limit defaults (conservative for Infura free tier)
 	if cfg.RateLimitRPM == 0 {
-		cfg.RateLimitRPM = 300 // Default 300 requests/minute
+		cfg.RateLimitRPM = 60 // Default 60 requests/minute (Infura free tier safe)
 	}
 	if cfg.RateLimitBurst == 0 {
-		cfg.RateLimitBurst = 20 // Default burst of 20
+		cfg.RateLimitBurst = 12 // Default burst of 12 (2 tiers × 2 directions × 3 sizes)
 	}
 	if cfg.RetryConfig.MaxAttempts == 0 {
 		cfg.RetryConfig = resilience.RetryConfig{
@@ -713,4 +713,63 @@ func (u *UniswapProvider) recordHealth(err error, duration time.Duration) {
 	u.health.LastFailure = time.Now()
 	u.health.LastError = err.Error()
 	u.health.ConsecutiveFailures++
+}
+
+// Name returns the provider name for warmup logging.
+func (u *UniswapProvider) Name() string {
+	if u.pairName != "" {
+		return fmt.Sprintf("uniswap:%s", u.pairName)
+	}
+	return "uniswap"
+}
+
+// Warmup pre-populates the cache with initial DEX quotes.
+// This implements the cache.WarmupProvider interface.
+// Uses a default trade size of 1 base token unit for warmup.
+func (u *UniswapProvider) Warmup(ctx context.Context) error {
+	// Default warmup size: 1 base token (e.g., 1 ETH)
+	oneBaseUnit := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(u.token1Decimals)), nil)
+	return u.WarmupWithSizes(ctx, []*big.Int{oneBaseUnit})
+}
+
+// WarmupWithSizes pre-populates the cache with quotes for specific trade sizes.
+func (u *UniswapProvider) WarmupWithSizes(ctx context.Context, sizes []*big.Int) error {
+	// Get current block for cache key
+	blockNum, err := u.client.BlockNumber(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get block number: %w", err)
+	}
+
+	// Default gas price for warmup (50 gwei)
+	defaultGasPrice := big.NewInt(50e9)
+
+	warmupCount := 0
+	for _, size := range sizes {
+		// Warm both directions for each size
+		for _, isBuy := range []bool{true, false} {
+			_, err := u.GetPrice(ctx, size, isBuy, defaultGasPrice, blockNum)
+			if err != nil {
+				u.logger.Warn("warmup quote failed",
+					"size", size.String(),
+					"is_buy", isBuy,
+					"error", err,
+				)
+				// Continue with other sizes/directions
+				continue
+			}
+			warmupCount++
+		}
+	}
+
+	if warmupCount == 0 {
+		return fmt.Errorf("all warmup quotes failed")
+	}
+
+	u.logger.Info("Uniswap cache warmed successfully",
+		"pair", u.pairName,
+		"quotes_cached", warmupCount,
+		"sizes", len(sizes),
+	)
+
+	return nil
 }

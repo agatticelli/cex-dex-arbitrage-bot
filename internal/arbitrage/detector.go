@@ -7,33 +7,55 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/config"
 	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/observability"
 	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/pricing"
+	"github.com/ethereum/go-ethereum/ethclient"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 )
 
-// PriceProvider defines the interface for fetching prices
-// Interfaces defined where they're consumed (Dependency Inversion Principle)
+// PriceProvider defines the interface for fetching prices from exchanges.
+// Implementations should handle rate limiting, retries, and caching internally.
+//
+// The interface follows the Dependency Inversion Principle - it is defined
+// where it's consumed (in the arbitrage package) rather than where it's implemented.
+//
+// Parameters:
+//   - ctx: Context for cancellation and timeout control
+//   - size: Trade size in raw units (with full decimals, e.g., 1e18 for 1 ETH)
+//   - isBuy: true for buying base token, false for selling
+//   - gasPrice: Current gas price in wei (nil to fetch from network - expensive)
+//   - blockNum: Current block number for cache key generation
+//
+// Returns:
+//   - Price struct containing execution price, slippage, gas costs, and metadata
+//   - error if the quote fails or times out
 type PriceProvider interface {
 	GetPrice(ctx context.Context, size *big.Int, isBuy bool, gasPrice *big.Int, blockNum uint64) (*pricing.Price, error)
 }
 
-// ETHPriceProvider is an optional interface for providers that can fetch ETH/USD price
+// ETHPriceProvider is an optional interface for providers that can fetch ETH/USD price.
+// Typically implemented by CEX providers that have direct access to ETH price data.
+// Used to convert gas costs from wei to USD for profit calculations.
 type ETHPriceProvider interface {
 	GetETHPrice(ctx context.Context) (float64, error)
 }
 
-// NotificationPublisher defines the interface for publishing opportunities
+// NotificationPublisher defines the interface for publishing arbitrage opportunities.
+// Implementations may publish to SNS, webhooks, logging systems, or other destinations.
+// The publisher should handle serialization, retries, and delivery confirmation.
 type NotificationPublisher interface {
 	PublishOpportunity(ctx context.Context, opp *Opportunity) error
 }
 
-// CacheStore defines the interface for caching
+// CacheStore defines a minimal interface for caching operations.
+// Used by the detector to cache gas prices, quotes, and other expensive computations.
+// Implementations should be thread-safe and handle TTL expiration.
 type CacheStore interface {
+	// Get retrieves a value from cache. Returns cache.ErrNotFound if key doesn't exist.
 	Get(ctx context.Context, key string) (interface{}, error)
+	// Set stores a value with the specified TTL. TTL of 0 means no expiration.
 	Set(ctx context.Context, key string, val interface{}, ttl time.Duration) error
 }
 
@@ -49,6 +71,7 @@ type Detector struct {
 	tradeSizes      []*big.Int
 	minProfitPct    float64
 	ethPriceUSD     float64
+	ethPriceMu      sync.RWMutex // Protects ethPriceUSD from concurrent access
 	tradingSymbol   string
 	dexQuoteLimiter *semaphore.Weighted
 
@@ -212,7 +235,7 @@ func (d *Detector) Detect(ctx context.Context, blockNum uint64, blockTime uint64
 
 	// Fetch latest ETH price from Binance
 	latestETHPrice := d.fetchLatestETHPrice(ctx)
-	if latestETHPrice != d.ethPriceUSD {
+	if latestETHPrice != d.getETHPriceUSD() {
 		d.UpdateETHPrice(latestETHPrice)
 	}
 
@@ -410,13 +433,22 @@ func (d *Detector) analyzeOpportunity(
 		dexPrice = buyPrice  // DEX is where we buy
 	}
 
-	profitMetrics, err := d.calculator.CalculateProfit(direction, tradeSize, cexPrice, dexPrice, d.ethPriceUSD)
+	profitMetrics, err := d.calculator.CalculateProfit(direction, tradeSize, cexPrice, dexPrice, d.getETHPriceUSD())
 	if err != nil {
 		d.logger.LogError(ctx, "failed to calculate profit", err,
 			"direction", direction.String(),
 			"trade_size", tradeSize.String(),
 		)
 		return nil
+	}
+	if profitMetrics.ValidationWarning != "" {
+		d.logger.Warn("profit calculation warning",
+			"warning", profitMetrics.ValidationWarning,
+			"direction", direction.String(),
+			"trade_size", tradeSize.String(),
+			"cex_price", cexPrice.Value.Text('f', 2),
+			"dex_price", dexPrice.Value.Text('f', 2),
+		)
 	}
 
 	// Create opportunity
@@ -511,9 +543,12 @@ func (d *Detector) GetTradeSizes() []*big.Int {
 	return d.tradeSizes
 }
 
-// UpdateETHPrice updates the ETH price used for calculations
+// UpdateETHPrice updates the ETH price used for calculations (thread-safe)
 func (d *Detector) UpdateETHPrice(priceUSD float64) {
+	d.ethPriceMu.Lock()
 	d.ethPriceUSD = priceUSD
+	d.ethPriceMu.Unlock()
+
 	d.logger.Info("updated ETH price", "price_usd", priceUSD)
 
 	// Record ETH price metric
@@ -522,22 +557,31 @@ func (d *Detector) UpdateETHPrice(priceUSD float64) {
 	}
 }
 
+// getETHPriceUSD returns the current ETH price in USD (thread-safe)
+func (d *Detector) getETHPriceUSD() float64 {
+	d.ethPriceMu.RLock()
+	defer d.ethPriceMu.RUnlock()
+	return d.ethPriceUSD
+}
+
 // fetchLatestETHPrice fetches the latest ETH price from the CEX provider
 // Returns the last known price if fetching fails or provider doesn't support it
 func (d *Detector) fetchLatestETHPrice(ctx context.Context) float64 {
 	// Check if CEX provider implements ETHPriceProvider interface
 	ethProvider, ok := d.cexProvider.(ETHPriceProvider)
 	if !ok {
-		d.logger.Debug("CEX provider does not support ETH price fetching, using cached price", "cached_price", d.ethPriceUSD)
-		return d.ethPriceUSD
+		cachedPrice := d.getETHPriceUSD()
+		d.logger.Debug("CEX provider does not support ETH price fetching, using cached price", "cached_price", cachedPrice)
+		return cachedPrice
 	}
 
 	price, err := ethProvider.GetETHPrice(ctx)
 	if err != nil {
+		cachedPrice := d.getETHPriceUSD()
 		d.logger.Warn("failed to fetch ETH price, using cached price",
 			"error", err,
-			"cached_price", d.ethPriceUSD)
-		return d.ethPriceUSD
+			"cached_price", cachedPrice)
+		return cachedPrice
 	}
 
 	return price

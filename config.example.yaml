@@ -159,9 +159,9 @@ observability:
     format: "json"  # json or text
 
   # Metrics settings
+  # Note: Metrics are exposed on the main HTTP server port (/metrics endpoint)
   metrics:
     enabled: true
-    port: 9090  # Prometheus metrics endpoint
 
   # Distributed tracing settings
   tracing:

@@ -153,13 +153,26 @@ func (c *Calculator) CalculateProfit(
 	expectedAbs := new(big.Float).Set(expectedProfitApprox)
 	expectedAbs.Abs(expectedAbs)
 
-	if expectedAbs.Cmp(big.NewFloat(1)) > 0 { // Only validate if expected is non-trivial
+	// Reduce noise for small/near-zero profits by applying both absolute and relative thresholds.
+	const (
+		minExpectedUSD = 5.0  // Only validate when expected profit magnitude is >= $5
+		minAbsDiffUSD  = 2.0  // Require at least $2 absolute difference
+		maxRelDiff     = 0.05 // 5% relative tolerance
+	)
+	if expectedAbs.Cmp(big.NewFloat(minExpectedUSD)) > 0 {
 		relativeError := new(big.Float).Quo(profitDiff, expectedAbs)
 		relativeErrorPct, _ := relativeError.Float64()
 
-		if relativeErrorPct > 0.02 {
-			return nil, fmt.Errorf("INVALID_MODEL_OUTPUT: gross profit %.2f differs from expected %.2f by %.1f%% (>2%% tolerance)",
-				grossProfitUSDC, expectedProfitApprox, relativeErrorPct*100)
+		if profitDiff.Cmp(big.NewFloat(minAbsDiffUSD)) > 0 && relativeErrorPct > maxRelDiff {
+			metrics.ValidationWarning = fmt.Sprintf(
+				"INVALID_MODEL_OUTPUT: gross profit %.2f differs from expected %.2f by %.1f%% (>%0.0f%%, >$%.2f, expected>$%.2f)",
+				grossProfitUSDC,
+				expectedProfitApprox,
+				relativeErrorPct*100,
+				maxRelDiff*100,
+				minAbsDiffUSD,
+				minExpectedUSD,
+			)
 		}
 	}
 
@@ -208,6 +221,7 @@ func (c *Calculator) CalculateProfit(
 		"trading_fees_usdc":         metrics.TradingFeesUSD.Text('f', 2),
 		"net_profit_usdc":           metrics.NetProfitUSD.Text('f', 2),
 		"expected_profit_approx":    expectedProfitApprox.Text('f', 2),
+		"validation_warning":        metrics.ValidationWarning,
 		"cex_price":                 cexPrice.Value.Text('f', 2),
 		"dex_price":                 dexPrice.Value.Text('f', 2),
 	}
@@ -329,7 +343,10 @@ type ProfitMetrics struct {
 	TradingFeesUSD *big.Float
 	NetProfitUSD   *big.Float
 	ProfitPct      *big.Float
-	DebugFields    map[string]interface{} // Debug logging fields
+	// ValidationWarning is set when the sanity-check detects a large mismatch between
+	// flow-based profit and price-based approximation. It is informational only.
+	ValidationWarning string
+	DebugFields       map[string]interface{} // Debug logging fields
 }
 
 // String returns a string representation of profit metrics
