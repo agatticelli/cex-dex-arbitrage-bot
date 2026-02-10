@@ -98,6 +98,15 @@ func (o *Opportunity) SetProfitMetrics(grossProfit, netProfit, profitPct *big.Fl
 
 // SetCosts sets the cost-related metrics
 func (o *Opportunity) SetCosts(gasCostWei *big.Int, gasCostUSD, tradingFees *big.Float) {
+	if gasCostWei == nil {
+		gasCostWei = big.NewInt(0)
+	}
+	if gasCostUSD == nil {
+		gasCostUSD = big.NewFloat(0)
+	}
+	if tradingFees == nil {
+		tradingFees = big.NewFloat(0)
+	}
 	o.GasCostWei = gasCostWei
 	o.GasCostUSD = gasCostUSD
 	o.TradingFees = tradingFees

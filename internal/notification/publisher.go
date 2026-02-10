@@ -7,6 +7,7 @@ import (
 	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/arbitrage"
 	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/aws"
 	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/observability"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Publisher publishes arbitrage opportunities to SNS
@@ -15,6 +16,7 @@ type Publisher struct {
 	topicARN  string
 	logger    *observability.Logger
 	metrics   *observability.Metrics
+	tracer    observability.Tracer
 }
 
 // PublisherConfig holds publisher configuration
@@ -23,6 +25,7 @@ type PublisherConfig struct {
 	TopicARN  string
 	Logger    *observability.Logger
 	Metrics   *observability.Metrics
+	Tracer    observability.Tracer
 }
 
 // NewPublisher creates a new arbitrage opportunity publisher
@@ -33,21 +36,37 @@ func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
 	if cfg.TopicARN == "" {
 		return nil, fmt.Errorf("SNS topic ARN is required")
 	}
+	if cfg.Tracer == nil {
+		cfg.Tracer = observability.NewNoopTracer()
+	}
 
 	return &Publisher{
 		snsClient: cfg.SNSClient,
 		topicARN:  cfg.TopicARN,
 		logger:    cfg.Logger,
 		metrics:   cfg.Metrics,
+		tracer:    cfg.Tracer,
 	}, nil
 }
 
 // PublishOpportunity publishes an arbitrage opportunity to SNS
 // Implements arbitrage.NotificationPublisher interface
 func (p *Publisher) PublishOpportunity(ctx context.Context, opp *arbitrage.Opportunity) error {
+	ctx, span := p.tracer.StartSpan(
+		ctx,
+		"Publisher.PublishOpportunity",
+		observability.WithAttributes(
+			attribute.String("opportunity_id", opp.OpportunityID),
+			attribute.Bool("profitable", opp.IsProfitable()),
+			attribute.String("topic_arn", p.topicARN),
+		),
+	)
+	defer span.End()
+
 	// Convert opportunity to JSON
 	payload, err := opp.ToJSON()
 	if err != nil {
+		span.NoticeError(err)
 		return fmt.Errorf("failed to marshal opportunity: %w", err)
 	}
 
@@ -67,6 +86,7 @@ func (p *Publisher) PublishOpportunity(ctx context.Context, opp *arbitrage.Oppor
 	// Publish to SNS
 	err = p.snsClient.Publish(ctx, p.topicARN, string(payload), attributes)
 	if err != nil {
+		span.NoticeError(err)
 		if p.logger != nil {
 			p.logger.LogError(ctx, "failed to publish to SNS", err,
 				"opportunity_id", opp.OpportunityID,

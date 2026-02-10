@@ -64,7 +64,61 @@ func TestParsePair_ValidETHPairs(t *testing.T) {
 	}
 }
 
-// TestParsePair_InvalidPairs tests rejection of non-ETH base pairs
+// TestParsePair_ValidNonETHPairs tests parsing of valid non-ETH base pairs
+func TestParsePair_ValidNonETHPairs(t *testing.T) {
+	tests := []struct {
+		name          string
+		pairName      string
+		expectedBase  string
+		expectedQuote string
+	}{
+		{
+			name:          "WBTC-USDC",
+			pairName:      "WBTC-USDC",
+			expectedBase:  "WBTC",
+			expectedQuote: "USDC",
+		},
+		{
+			name:          "LINK-USDT",
+			pairName:      "LINK-USDT",
+			expectedBase:  "LINK",
+			expectedQuote: "USDT",
+		},
+		{
+			name:          "UNI-DAI",
+			pairName:      "UNI-DAI",
+			expectedBase:  "UNI",
+			expectedQuote: "DAI",
+		},
+		{
+			name:          "AAVE-USDC",
+			pairName:      "AAVE-USDC",
+			expectedBase:  "AAVE",
+			expectedQuote: "USDC",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			base, quote, err := ParsePair(tt.pairName)
+			if err != nil {
+				t.Fatalf("ParsePair(%s) failed: %v", tt.pairName, err)
+			}
+
+			if base.Symbol != tt.expectedBase {
+				t.Errorf("Base symbol: expected %s, got %s", tt.expectedBase, base.Symbol)
+			}
+
+			if quote.Symbol != tt.expectedQuote {
+				t.Errorf("Quote symbol: expected %s, got %s", tt.expectedQuote, quote.Symbol)
+			}
+
+			t.Logf("✓ Parsed %s: base=%s, quote=%s", tt.pairName, base.Symbol, quote.Symbol)
+		})
+	}
+}
+
+// TestParsePair_InvalidPairs tests rejection of invalid pairs
 func TestParsePair_InvalidPairs(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -72,24 +126,19 @@ func TestParsePair_InvalidPairs(t *testing.T) {
 		errorMsg string
 	}{
 		{
-			name:     "BTC-USDC (non-ETH base)",
+			name:     "BTC-USDC (not in registry)",
 			pairName: "BTC-USDC",
-			errorMsg: "only ETH-X pairs are supported",
+			errorMsg: "unknown base token",
 		},
 		{
-			name:     "USDC-ETH (inverted)",
-			pairName: "USDC-ETH",
-			errorMsg: "only ETH-X pairs are supported",
-		},
-		{
-			name:     "USDC-USDT (no ETH)",
-			pairName: "USDC-USDT",
-			errorMsg: "only ETH-X pairs are supported",
-		},
-		{
-			name:     "ETH-BTC (invalid quote token removed from registry)",
+			name:     "ETH-BTC (invalid quote token)",
 			pairName: "ETH-BTC",
 			errorMsg: "unknown quote token",
+		},
+		{
+			name:     "ETH-ETH (same token)",
+			pairName: "ETH-ETH",
+			errorMsg: "must be different",
 		},
 		{
 			name:     "invalid format",
@@ -100,6 +149,16 @@ func TestParsePair_InvalidPairs(t *testing.T) {
 			name:     "too many dashes",
 			pairName: "ETH-USDC-DAI",
 			errorMsg: "invalid pair format",
+		},
+		{
+			name:     "UNKNOWN-USDC",
+			pairName: "UNKNOWN-USDC",
+			errorMsg: "unknown base token",
+		},
+		{
+			name:     "ETH-UNKNOWN",
+			pairName: "ETH-UNKNOWN",
+			errorMsg: "unknown quote token",
 		},
 	}
 
@@ -144,10 +203,16 @@ func TestFormatCEXSymbol(t *testing.T) {
 	}
 }
 
-// TestTokenRegistry_OnlyETHAndQuoteTokens verifies registry only contains ETH + quote tokens
-func TestTokenRegistry_OnlyETHAndQuoteTokens(t *testing.T) {
+// TestTokenRegistry_ExpectedTokens verifies registry contains all expected tokens
+func TestTokenRegistry_ExpectedTokens(t *testing.T) {
 	expectedTokens := map[string]bool{
+		// Base tokens
 		"ETH":  true,
+		"WBTC": true,
+		"LINK": true,
+		"UNI":  true,
+		"AAVE": true,
+		// Quote tokens (stablecoins)
 		"USDC": true,
 		"USDT": true,
 		"DAI":  true,
@@ -155,7 +220,7 @@ func TestTokenRegistry_OnlyETHAndQuoteTokens(t *testing.T) {
 
 	for symbol := range TokenRegistry {
 		if !expectedTokens[symbol] {
-			t.Errorf("Unexpected token in registry: %s (only ETH and quote tokens should be present)", symbol)
+			t.Errorf("Unexpected token in registry: %s", symbol)
 		}
 	}
 
@@ -165,7 +230,7 @@ func TestTokenRegistry_OnlyETHAndQuoteTokens(t *testing.T) {
 		}
 	}
 
-	t.Logf("✓ Token registry contains only: %v", getKeys(TokenRegistry))
+	t.Logf("✓ Token registry contains: %v", getKeys(TokenRegistry))
 }
 
 // TestTokenRegistry_ETHMetadata verifies ETH token metadata

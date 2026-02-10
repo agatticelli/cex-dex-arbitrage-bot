@@ -8,6 +8,17 @@ import (
 	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/pricing"
 )
 
+// calculateTestGasCostUSD is a helper to convert gas cost from wei to USD for tests.
+// Mirrors the logic in detector and pipeline.
+func calculateTestGasCostUSD(gasCostWei *big.Int, ethPriceUSD float64) *big.Float {
+	if gasCostWei == nil || gasCostWei.Cmp(big.NewInt(0)) == 0 {
+		return big.NewFloat(0)
+	}
+	gasCostETH := new(big.Float).SetInt(gasCostWei)
+	gasCostETH.Quo(gasCostETH, big.NewFloat(1e18))
+	return new(big.Float).Mul(gasCostETH, big.NewFloat(ethPriceUSD))
+}
+
 // TestProfitCalculationCEXToDEX tests profit calculation for CEX→DEX arbitrage
 func TestProfitCalculationCEXToDEX(t *testing.T) {
 	calculator := NewCalculator()
@@ -45,8 +56,11 @@ func TestProfitCalculationCEXToDEX(t *testing.T) {
 	tradeSize := big.NewInt(1e18) // 1 ETH
 	ethPriceUSD := 2055.0         // Current ETH price
 
+	// Calculate gas cost in USD (pre-calculated, as the new API expects)
+	gasCostUSD := calculateTestGasCostUSD(dexSellPrice.GasCost, ethPriceUSD)
+
 	// Calculate profit
-	metrics, err := calculator.CalculateProfit(CEXToDEX, tradeSize, cexBuyPrice, dexSellPrice, ethPriceUSD)
+	metrics, err := calculator.CalculateProfit(CEXToDEX, tradeSize, cexBuyPrice, dexSellPrice, gasCostUSD)
 	if err != nil {
 		t.Fatalf("CalculateProfit failed: %v", err)
 	}
@@ -127,8 +141,11 @@ func TestProfitCalculationDEXToCEX(t *testing.T) {
 	tradeSize := big.NewInt(1e18) // 1 ETH
 	ethPriceUSD := 2047.0         // Current ETH price
 
+	// Calculate gas cost in USD (pre-calculated, as the new API expects)
+	gasCostUSD := calculateTestGasCostUSD(dexBuyPrice.GasCost, ethPriceUSD)
+
 	// Calculate profit
-	metrics, err := calculator.CalculateProfit(DEXToCEX, tradeSize, cexSellPrice, dexBuyPrice, ethPriceUSD)
+	metrics, err := calculator.CalculateProfit(DEXToCEX, tradeSize, cexSellPrice, dexBuyPrice, gasCostUSD)
 	if err != nil {
 		t.Fatalf("CalculateProfit failed: %v", err)
 	}
@@ -195,8 +212,11 @@ func TestProfitCalculationProfitableOpportunity(t *testing.T) {
 	tradeSize := big.NewInt(1e18) // 1 ETH
 	ethPriceUSD := 2050.0
 
+	// Calculate gas cost in USD (pre-calculated, as the new API expects)
+	gasCostUSD := calculateTestGasCostUSD(dexSellPrice.GasCost, ethPriceUSD)
+
 	// Calculate profit
-	metrics, err := calculator.CalculateProfit(CEXToDEX, tradeSize, cexBuyPrice, dexSellPrice, ethPriceUSD)
+	metrics, err := calculator.CalculateProfit(CEXToDEX, tradeSize, cexBuyPrice, dexSellPrice, gasCostUSD)
 	if err != nil {
 		t.Fatalf("CalculateProfit failed: %v", err)
 	}
@@ -285,26 +305,29 @@ func TestGasCostCalculation(t *testing.T) {
 				Timestamp:    time.Now(),
 			}
 
+			// Calculate gas cost in USD (input to CalculateProfit)
+			gasCostInput := calculateTestGasCostUSD(big.NewInt(tt.gasCostWei), tt.ethPriceUSD)
+
 			metrics, err := calculator.CalculateProfit(
 				CEXToDEX,
 				big.NewInt(1e18),
 				cexPrice,
 				dexPrice,
-				tt.ethPriceUSD,
+				gasCostInput,
 			)
 			if err != nil {
 				t.Fatalf("CalculateProfit failed: %v", err)
 			}
 
-			gasCostUSD, _ := metrics.GasCostUSD.Float64()
+			gasCostResult, _ := metrics.GasCostUSD.Float64()
 
-			if gasCostUSD < tt.expectedUSD-tt.tolerance || gasCostUSD > tt.expectedUSD+tt.tolerance {
+			if gasCostResult < tt.expectedUSD-tt.tolerance || gasCostResult > tt.expectedUSD+tt.tolerance {
 				t.Errorf("Gas cost $%.2f outside expected range $%.2f ± $%.2f",
-					gasCostUSD, tt.expectedUSD, tt.tolerance)
+					gasCostResult, tt.expectedUSD, tt.tolerance)
 			}
 
 			t.Logf("✓ Gas cost: %.6f ETH × $%.2f = $%.2f",
-				float64(tt.gasCostWei)/1e18, tt.ethPriceUSD, gasCostUSD)
+				float64(tt.gasCostWei)/1e18, tt.ethPriceUSD, gasCostResult)
 		})
 	}
 }
@@ -371,12 +394,15 @@ func TestTradingSizeScaling(t *testing.T) {
 				Timestamp:    time.Now(),
 			}
 
+			// Calculate gas cost in USD (gas cost stays the same regardless of trade size)
+			gasCostUSD := calculateTestGasCostUSD(scaledDexPrice.GasCost, 2006.0)
+
 			metrics, err := calculator.CalculateProfit(
 				CEXToDEX,
 				tradeSize,
 				scaledCexPrice,
 				scaledDexPrice,
-				2006.0,
+				gasCostUSD,
 			)
 			if err != nil {
 				t.Fatalf("CalculateProfit failed: %v", err)
@@ -475,7 +501,8 @@ func TestCalculateProfitEdgeCases(t *testing.T) {
 			Timestamp:    time.Now(),
 		}
 
-		_, err := calculator.CalculateProfit(CEXToDEX, big.NewInt(1e18), cexPrice, dexPrice, 2000.0)
+		gasCostUSD := calculateTestGasCostUSD(dexPrice.GasCost, 2000.0)
+		_, err := calculator.CalculateProfit(CEXToDEX, big.NewInt(1e18), cexPrice, dexPrice, gasCostUSD)
 		if err == nil {
 			t.Error("Expected error for nil AmountOut, got nil")
 		}
@@ -500,7 +527,8 @@ func TestCalculateProfitEdgeCases(t *testing.T) {
 			Timestamp:  time.Now(),
 		}
 
-		_, err := calculator.CalculateProfit(CEXToDEX, big.NewInt(1e18), cexPrice, dexPrice, 2000.0)
+		gasCostUSD := calculateTestGasCostUSD(dexPrice.GasCost, 2000.0)
+		_, err := calculator.CalculateProfit(CEXToDEX, big.NewInt(1e18), cexPrice, dexPrice, gasCostUSD)
 		if err == nil {
 			t.Error("Expected error for nil AmountOut, got nil")
 		}
@@ -526,7 +554,8 @@ func TestCalculateProfitEdgeCases(t *testing.T) {
 			Timestamp:    time.Now(),
 		}
 
-		metrics, err := calculator.CalculateProfit(CEXToDEX, big.NewInt(0), cexPrice, dexPrice, 2000.0)
+		gasCostUSD := calculateTestGasCostUSD(dexPrice.GasCost, 2000.0)
+		metrics, err := calculator.CalculateProfit(CEXToDEX, big.NewInt(0), cexPrice, dexPrice, gasCostUSD)
 		if err != nil {
 			t.Fatalf("Unexpected error for zero trade size: %v", err)
 		}
@@ -566,7 +595,9 @@ func TestCalculateProfitEdgeCases(t *testing.T) {
 			Timestamp:    time.Now(),
 		}
 
-		metrics, err := calculator.CalculateProfit(CEXToDEX, big.NewInt(1e18), cexPrice, dexPrice, 2000.0)
+		// nil gas cost should result in 0 gas cost USD
+		gasCostUSD := calculateTestGasCostUSD(dexPrice.GasCost, 2000.0)
+		metrics, err := calculator.CalculateProfit(CEXToDEX, big.NewInt(1e18), cexPrice, dexPrice, gasCostUSD)
 		if err != nil {
 			t.Fatalf("Unexpected error for nil gas cost: %v", err)
 		}
@@ -667,7 +698,8 @@ func TestFeeApplication(t *testing.T) {
 				Timestamp:    time.Now(),
 			}
 
-			_, err := calculator.CalculateProfit(tt.direction, big.NewInt(1e18), cexPrice, dexPrice, tt.basePrice)
+			gasCostUSD := calculateTestGasCostUSD(dexPrice.GasCost, tt.basePrice)
+			_, err := calculator.CalculateProfit(tt.direction, big.NewInt(1e18), cexPrice, dexPrice, gasCostUSD)
 			if err != nil {
 				t.Fatalf("CalculateProfit failed: %v", err)
 			}
@@ -740,7 +772,8 @@ func TestProfitWithHighGas(t *testing.T) {
 				Timestamp:    time.Now(),
 			}
 
-			metrics, err := calculator.CalculateProfit(CEXToDEX, big.NewInt(1e18), cexPrice, dexPrice, tt.ethPriceUSD)
+			gasCostUSD := calculateTestGasCostUSD(dexPrice.GasCost, tt.ethPriceUSD)
+			metrics, err := calculator.CalculateProfit(CEXToDEX, big.NewInt(1e18), cexPrice, dexPrice, gasCostUSD)
 			if err != nil {
 				t.Fatalf("CalculateProfit failed: %v", err)
 			}
@@ -807,7 +840,8 @@ func TestProfitPctUsesBuySidePrice(t *testing.T) {
 		Timestamp:     time.Now(),
 	}
 
-	metrics, err := calculator.CalculateProfit(DEXToCEX, tradeSize, cexPrice, dexPrice, 2000.0)
+	gasCostUSD := calculateTestGasCostUSD(dexPrice.GasCost, 2000.0)
+	metrics, err := calculator.CalculateProfit(DEXToCEX, tradeSize, cexPrice, dexPrice, gasCostUSD)
 	if err != nil {
 		t.Fatalf("CalculateProfit failed: %v", err)
 	}

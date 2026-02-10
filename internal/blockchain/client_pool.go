@@ -18,6 +18,7 @@ type RPCEndpoint struct {
 	Weight  int
 	Client  *ethclient.Client
 	healthy atomic.Bool
+	mu      sync.RWMutex // Protects Client field
 }
 
 // ClientPool manages multiple RPC endpoints with health tracking and failover
@@ -28,6 +29,8 @@ type ClientPool struct {
 	logger         *observability.Logger
 	metrics        *observability.Metrics
 	healthCheckTTL time.Duration
+	ctx            context.Context    // Context for health check goroutine
+	cancel         context.CancelFunc // Cancel function to stop health checks
 }
 
 // ClientPoolConfig holds client pool configuration
@@ -101,16 +104,20 @@ func NewClientPool(cfg ClientPoolConfig) (*ClientPool, error) {
 		return nil, fmt.Errorf("no healthy RPC endpoints available")
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	pool := &ClientPool{
 		endpoints:      endpoints,
 		current:        0,
 		logger:         cfg.Logger,
 		metrics:        cfg.Metrics,
 		healthCheckTTL: cfg.HealthCheckTTL,
+		ctx:            ctx,
+		cancel:         cancel,
 	}
 
 	// Start background health checks
-	go pool.startHealthChecks(context.Background())
+	go pool.startHealthChecks(pool.ctx)
 
 	return pool, nil
 }
@@ -131,9 +138,13 @@ func (cp *ClientPool) GetClient() (*ethclient.Client, error) {
 		cp.current = (cp.current + 1) % len(cp.endpoints)
 		attempts++
 
-		// Check if endpoint is healthy
-		if endpoint.healthy.Load() && endpoint.Client != nil {
-			return endpoint.Client, nil
+		// Check if endpoint is healthy and has a client
+		endpoint.mu.RLock()
+		client := endpoint.Client
+		endpoint.mu.RUnlock()
+
+		if endpoint.healthy.Load() && client != nil {
+			return client, nil
 		}
 	}
 
@@ -148,8 +159,13 @@ func (cp *ClientPool) GetClientByURL(url string) (*ethclient.Client, error) {
 	defer cp.mu.RUnlock()
 
 	for _, endpoint := range cp.endpoints {
-		if endpoint.URL == url && endpoint.healthy.Load() && endpoint.Client != nil {
-			return endpoint.Client, nil
+		if endpoint.URL == url && endpoint.healthy.Load() {
+			endpoint.mu.RLock()
+			client := endpoint.Client
+			endpoint.mu.RUnlock()
+			if client != nil {
+				return client, nil
+			}
 		}
 	}
 
@@ -211,9 +227,13 @@ func (cp *ClientPool) checkAllEndpoints(ctx context.Context) {
 
 // checkEndpoint checks if an endpoint is healthy by fetching block number
 func (cp *ClientPool) checkEndpoint(ctx context.Context, endpoint *RPCEndpoint) {
-	// If client is nil, try to reconnect
-	if endpoint.Client == nil {
-		client, err := ethclient.Dial(endpoint.URL)
+	// Check if client is nil (need to reconnect)
+	endpoint.mu.RLock()
+	client := endpoint.Client
+	endpoint.mu.RUnlock()
+
+	if client == nil {
+		newClient, err := ethclient.Dial(endpoint.URL)
 		if err != nil {
 			endpoint.healthy.Store(false)
 			if cp.metrics != nil {
@@ -221,12 +241,15 @@ func (cp *ClientPool) checkEndpoint(ctx context.Context, endpoint *RPCEndpoint) 
 			}
 			return
 		}
-		endpoint.Client = client
+		endpoint.mu.Lock()
+		endpoint.Client = newClient
+		client = newClient
+		endpoint.mu.Unlock()
 		cp.logger.Info("reconnected to RPC endpoint", "url", endpoint.URL)
 	}
 
 	// Try to fetch latest block number
-	_, err := endpoint.Client.BlockNumber(ctx)
+	_, err := client.BlockNumber(ctx)
 	if err != nil {
 		// Check if error is temporary (context canceled/timeout)
 		// Don't close client for temporary errors
@@ -249,10 +272,12 @@ func (cp *ClientPool) checkEndpoint(ctx context.Context, endpoint *RPCEndpoint) 
 			}
 
 			// Close unhealthy client for persistent errors
+			endpoint.mu.Lock()
 			if endpoint.Client != nil {
 				endpoint.Client.Close()
 				endpoint.Client = nil
 			}
+			endpoint.mu.Unlock()
 		} else {
 			// Temporary error - keep client alive but log warning
 			cp.logger.Debug("RPC health check had temporary error (keeping client alive)",
@@ -304,15 +329,23 @@ func (cp *ClientPool) GetEndpointStatus() map[string]bool {
 	return status
 }
 
-// Close closes all client connections
+// Close closes all client connections and stops health check goroutine
 func (cp *ClientPool) Close() {
+	// Cancel health check goroutine first
+	if cp.cancel != nil {
+		cp.cancel()
+	}
+
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
 
 	for _, endpoint := range cp.endpoints {
+		endpoint.mu.Lock()
 		if endpoint.Client != nil {
 			endpoint.Client.Close()
+			endpoint.Client = nil
 		}
+		endpoint.mu.Unlock()
 	}
 
 	cp.logger.Info("closed all RPC client connections")

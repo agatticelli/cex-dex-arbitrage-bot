@@ -17,7 +17,8 @@ import (
 
 // Metrics holds all application metrics
 type Metrics struct {
-	meter metric.Meter
+	enabled bool
+	meter   metric.Meter
 
 	// Block processing metrics
 	BlockProcessingDuration metric.Float64Histogram
@@ -69,7 +70,14 @@ type Metrics struct {
 	CircuitBreakerState metric.Int64Gauge
 
 	// Error metrics
-	Errors metric.Int64Counter
+	Errors        metric.Int64Counter
+	DroppedErrors metric.Int64Counter
+
+	// Pipeline metrics
+	PipelineStageLatency   metric.Float64Histogram
+	PipelineBackpressure   metric.Int64Gauge
+	PipelineThroughput     metric.Float64Gauge
+	PipelineItemsProcessed metric.Int64Counter
 
 	// Prometheus exporter for HTTP handler
 	exporter *prometheus.Exporter
@@ -78,7 +86,9 @@ type Metrics struct {
 // NewMetrics creates a new Metrics instance
 func NewMetrics(serviceName string, enabled bool) (*Metrics, error) {
 	if !enabled {
-		return &Metrics{}, nil
+		return &Metrics{
+			enabled: false,
+		}, nil
 	}
 
 	// Create resource
@@ -110,6 +120,7 @@ func NewMetrics(serviceName string, enabled bool) (*Metrics, error) {
 
 	// Create metrics instance
 	m := &Metrics{
+		enabled:  true,
 		meter:    meter,
 		exporter: exporter,
 	}
@@ -120,6 +131,10 @@ func NewMetrics(serviceName string, enabled bool) (*Metrics, error) {
 	}
 
 	return m, nil
+}
+
+func (m *Metrics) isEnabled() bool {
+	return m != nil && m.enabled
 }
 
 // initMetrics initializes all metric instruments
@@ -339,17 +354,66 @@ func (m *Metrics) initMetrics() error {
 		return err
 	}
 
+	m.DroppedErrors, err = m.meter.Int64Counter(
+		"arbitrage.errors.dropped",
+		metric.WithDescription("Errors dropped due to full channel buffer"),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Pipeline metrics
+	m.PipelineStageLatency, err = m.meter.Float64Histogram(
+		"arbitrage.pipeline.stage.latency",
+		metric.WithDescription("Pipeline stage processing latency in milliseconds"),
+		metric.WithUnit("ms"),
+	)
+	if err != nil {
+		return err
+	}
+
+	m.PipelineBackpressure, err = m.meter.Int64Gauge(
+		"arbitrage.pipeline.backpressure",
+		metric.WithDescription("Pipeline channel buffer utilization (items in queue)"),
+	)
+	if err != nil {
+		return err
+	}
+
+	m.PipelineThroughput, err = m.meter.Float64Gauge(
+		"arbitrage.pipeline.throughput",
+		metric.WithDescription("Pipeline throughput in items per second"),
+		metric.WithUnit("items/s"),
+	)
+	if err != nil {
+		return err
+	}
+
+	m.PipelineItemsProcessed, err = m.meter.Int64Counter(
+		"arbitrage.pipeline.items.processed",
+		metric.WithDescription("Total items processed by pipeline"),
+	)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
 // RecordBlockProcessing records block processing duration
 func (m *Metrics) RecordBlockProcessing(ctx context.Context, duration time.Duration) {
+	if !m.isEnabled() {
+		return
+	}
 	m.BlockProcessingDuration.Record(ctx, float64(duration.Milliseconds()))
 	m.BlocksProcessed.Add(ctx, 1)
 }
 
 // RecordOpportunity records an arbitrage opportunity
 func (m *Metrics) RecordOpportunity(ctx context.Context, pair string, direction string, profitable bool, profitUSD float64) {
+	if !m.isEnabled() {
+		return
+	}
 	attrs := []attribute.KeyValue{
 		attribute.String("pair", pair),
 		attribute.String("direction", direction),
@@ -365,6 +429,9 @@ func (m *Metrics) RecordOpportunity(ctx context.Context, pair string, direction 
 
 // RecordCEXAPICall records a CEX API call
 func (m *Metrics) RecordCEXAPICall(ctx context.Context, exchange, endpoint, status string, duration time.Duration) {
+	if !m.isEnabled() {
+		return
+	}
 	attrs := []attribute.KeyValue{
 		attribute.String("exchange", exchange),
 		attribute.String("endpoint", endpoint),
@@ -377,6 +444,9 @@ func (m *Metrics) RecordCEXAPICall(ctx context.Context, exchange, endpoint, stat
 
 // RecordDEXQuote records a DEX quote call
 func (m *Metrics) RecordDEXQuote(ctx context.Context, dex string, duration time.Duration, success bool) {
+	if !m.isEnabled() {
+		return
+	}
 	attrs := []attribute.KeyValue{
 		attribute.String("dex", dex),
 		attribute.Bool("success", success),
@@ -388,6 +458,9 @@ func (m *Metrics) RecordDEXQuote(ctx context.Context, dex string, duration time.
 
 // RecordWebSocketReconnection records a WebSocket reconnection
 func (m *Metrics) RecordWebSocketReconnection(ctx context.Context, attempts int) {
+	if !m.isEnabled() {
+		return
+	}
 	m.WebSocketReconnections.Add(ctx, 1, metric.WithAttributes(
 		attribute.Int("attempts", attempts),
 	))
@@ -395,6 +468,9 @@ func (m *Metrics) RecordWebSocketReconnection(ctx context.Context, attempts int)
 
 // RecordWebSocketConnection records WebSocket connection status with URL
 func (m *Metrics) RecordWebSocketConnection(ctx context.Context, url string, connected bool) {
+	if !m.isEnabled() {
+		return
+	}
 	val := int64(0)
 	if connected {
 		val = 1
@@ -406,6 +482,9 @@ func (m *Metrics) RecordWebSocketConnection(ctx context.Context, url string, con
 
 // RecordBlockReceived records a block received from WebSocket
 func (m *Metrics) RecordBlockReceived(ctx context.Context, blockNumber uint64) {
+	if !m.isEnabled() {
+		return
+	}
 	m.BlocksReceived.Add(ctx, 1, metric.WithAttributes(
 		attribute.Int64("block_number", int64(blockNumber)),
 	))
@@ -413,6 +492,9 @@ func (m *Metrics) RecordBlockReceived(ctx context.Context, blockNumber uint64) {
 
 // RecordBlockGap records a gap in block sequence
 func (m *Metrics) RecordBlockGap(ctx context.Context, gap int64) {
+	if !m.isEnabled() {
+		return
+	}
 	m.BlockGaps.Add(ctx, 1, metric.WithAttributes(
 		attribute.Int64("gap_size", gap),
 	))
@@ -420,6 +502,9 @@ func (m *Metrics) RecordBlockGap(ctx context.Context, gap int64) {
 
 // RecordRPCEndpointHealth records RPC endpoint health status
 func (m *Metrics) RecordRPCEndpointHealth(ctx context.Context, url string, healthy bool) {
+	if !m.isEnabled() {
+		return
+	}
 	val := int64(0)
 	if healthy {
 		val = 1
@@ -431,6 +516,9 @@ func (m *Metrics) RecordRPCEndpointHealth(ctx context.Context, url string, healt
 
 // SetWebSocketConnected sets WebSocket connection status
 func (m *Metrics) SetWebSocketConnected(ctx context.Context, connected bool) {
+	if !m.isEnabled() {
+		return
+	}
 	val := int64(0)
 	if connected {
 		val = 1
@@ -440,27 +528,54 @@ func (m *Metrics) SetWebSocketConnected(ctx context.Context, connected bool) {
 
 // RecordCacheHit records a cache hit
 func (m *Metrics) RecordCacheHit(ctx context.Context, layer string) {
+	if !m.isEnabled() {
+		return
+	}
 	m.CacheHits.Add(ctx, 1, metric.WithAttributes(attribute.String("layer", layer)))
 }
 
 // RecordCacheMiss records a cache miss
 func (m *Metrics) RecordCacheMiss(ctx context.Context, layer string) {
+	if !m.isEnabled() {
+		return
+	}
 	m.CacheMisses.Add(ctx, 1, metric.WithAttributes(attribute.String("layer", layer)))
 }
 
 // SetCircuitBreakerState sets circuit breaker state
 // 0 = closed, 1 = open, 2 = half-open
 func (m *Metrics) SetCircuitBreakerState(ctx context.Context, service string, state int64) {
+	if !m.isEnabled() {
+		return
+	}
 	m.CircuitBreakerState.Record(ctx, state, metric.WithAttributes(attribute.String("service", service)))
 }
 
 // RecordError records an error
 func (m *Metrics) RecordError(ctx context.Context, errorType string) {
+	if !m.isEnabled() {
+		return
+	}
 	m.Errors.Add(ctx, 1, metric.WithAttributes(attribute.String("type", errorType)))
+}
+
+// RecordDroppedError records an error that was dropped due to full channel buffer
+func (m *Metrics) RecordDroppedError(ctx context.Context, source string, errorType string) {
+	if !m.isEnabled() {
+		return
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String("source", source),
+		attribute.String("error_type", errorType),
+	}
+	m.DroppedErrors.Add(ctx, 1, metric.WithAttributes(attrs...))
 }
 
 // RecordFeeTierUsed records when a specific fee tier is selected for best execution
 func (m *Metrics) RecordFeeTierUsed(ctx context.Context, feeTier uint32) {
+	if !m.isEnabled() {
+		return
+	}
 	m.FeeTierSelected.Add(ctx, 1, metric.WithAttributes(
 		attribute.Int64("fee_tier", int64(feeTier)),
 	))
@@ -468,11 +583,17 @@ func (m *Metrics) RecordFeeTierUsed(ctx context.Context, feeTier uint32) {
 
 // RecordETHPrice records the current ETH price in USD
 func (m *Metrics) RecordETHPrice(ctx context.Context, priceUSD float64) {
+	if !m.isEnabled() {
+		return
+	}
 	m.ETHPriceUSD.Record(ctx, priceUSD)
 }
 
 // RecordQuoterCall records a QuoterV2 contract call
 func (m *Metrics) RecordQuoterCall(ctx context.Context, feeTier uint32, status string, duration time.Duration) {
+	if !m.isEnabled() {
+		return
+	}
 	attrs := []attribute.KeyValue{
 		attribute.Int64("fee_tier", int64(feeTier)),
 		attribute.String("status", status),
@@ -483,6 +604,9 @@ func (m *Metrics) RecordQuoterCall(ctx context.Context, feeTier uint32, status s
 
 // RecordQuoteCacheRequest records a quote cache request (hit or miss)
 func (m *Metrics) RecordQuoteCacheRequest(ctx context.Context, pair string, feeTier uint32, provider, layer string, hit bool) {
+	if !m.isEnabled() {
+		return
+	}
 	status := "miss"
 	if hit {
 		status = "hit"
@@ -502,12 +626,79 @@ func (m *Metrics) RecordQuoteCacheRequest(ctx context.Context, pair string, feeT
 
 // RecordBlockGapBackfill records a block gap backfill operation
 func (m *Metrics) RecordBlockGapBackfill(ctx context.Context, blocksRecovered int64, duration time.Duration) {
+	if !m.isEnabled() {
+		return
+	}
 	m.BlockGapBackfillTotal.Add(ctx, blocksRecovered)
 	m.BlockGapBackfillDuration.Record(ctx, float64(duration.Milliseconds()))
 }
 
+// RecordWebSocketHealthCheck records a WebSocket health check result
+func (m *Metrics) RecordWebSocketHealthCheck(ctx context.Context, latency time.Duration, success bool) {
+	if !m.isEnabled() {
+		return
+	}
+	// Record as a reconnection attempt if failed (reuses existing metric)
+	if !success {
+		m.WebSocketReconnections.Add(ctx, 0) // Just to have the metric present
+	}
+	// Health check latency could be added as a new histogram if needed
+}
+
+// RecordPipelineStageLatency records the latency for a pipeline stage
+func (m *Metrics) RecordPipelineStageLatency(ctx context.Context, stage string, duration time.Duration) {
+	if !m.isEnabled() {
+		return
+	}
+	if m.PipelineStageLatency == nil {
+		return
+	}
+	m.PipelineStageLatency.Record(ctx, float64(duration.Milliseconds()),
+		metric.WithAttributes(attribute.String("stage", stage)))
+}
+
+// RecordPipelineBackpressure records the current queue depth for a pipeline stage
+func (m *Metrics) RecordPipelineBackpressure(ctx context.Context, stage string, queueLen int) {
+	if !m.isEnabled() {
+		return
+	}
+	if m.PipelineBackpressure == nil {
+		return
+	}
+	m.PipelineBackpressure.Record(ctx, int64(queueLen),
+		metric.WithAttributes(attribute.String("stage", stage)))
+}
+
+// RecordPipelineThroughput records the pipeline throughput
+func (m *Metrics) RecordPipelineThroughput(ctx context.Context, itemsPerSecond float64) {
+	if !m.isEnabled() {
+		return
+	}
+	if m.PipelineThroughput == nil {
+		return
+	}
+	m.PipelineThroughput.Record(ctx, itemsPerSecond)
+}
+
+// RecordPipelineItemProcessed records a single item processed by the pipeline
+func (m *Metrics) RecordPipelineItemProcessed(ctx context.Context, stage string) {
+	if !m.isEnabled() {
+		return
+	}
+	if m.PipelineItemsProcessed == nil {
+		return
+	}
+	m.PipelineItemsProcessed.Add(ctx, 1,
+		metric.WithAttributes(attribute.String("stage", stage)))
+}
+
 // Handler returns the HTTP handler for Prometheus metrics
 func (m *Metrics) Handler() http.Handler {
+	if !m.isEnabled() {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		})
+	}
 	// Use the standard Prometheus HTTP handler
 	// The OpenTelemetry Prometheus exporter automatically registers metrics
 	// with the default Prometheus registry

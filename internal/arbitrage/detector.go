@@ -11,107 +11,97 @@ import (
 	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/observability"
 	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/pricing"
 	"github.com/ethereum/go-ethereum/ethclient"
-	"golang.org/x/sync/errgroup"
+	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/sync/semaphore"
 )
 
-// PriceProvider defines the interface for fetching prices from exchanges.
-// Implementations should handle rate limiting, retries, and caching internally.
-//
-// The interface follows the Dependency Inversion Principle - it is defined
-// where it's consumed (in the arbitrage package) rather than where it's implemented.
-//
-// Parameters:
-//   - ctx: Context for cancellation and timeout control
-//   - size: Trade size in raw units (with full decimals, e.g., 1e18 for 1 ETH)
-//   - isBuy: true for buying base token, false for selling
-//   - gasPrice: Current gas price in wei (nil to fetch from network - expensive)
-//   - blockNum: Current block number for cache key generation
-//
-// Returns:
-//   - Price struct containing execution price, slippage, gas costs, and metadata
-//   - error if the quote fails or times out
+// PriceProvider fetches execution prices from an exchange (CEX or DEX).
+// Implementations must handle rate limiting, caching, and error recovery.
 type PriceProvider interface {
+	// GetPrice returns the execution price for a given trade.
+	//
+	// Parameters:
+	//   - ctx: Context for cancellation and timeouts
+	//   - size: Trade size in base token raw units (e.g., 1e18 for 1 ETH)
+	//   - isBuy: true = buying base token, false = selling base token
+	//   - gasPrice: Current gas price in wei (DEX only, nil for CEX)
+	//   - blockNum: Current block number for cache keying
+	//
+	// Returns the execution details including effective price, slippage, and fees.
 	GetPrice(ctx context.Context, size *big.Int, isBuy bool, gasPrice *big.Int, blockNum uint64) (*pricing.Price, error)
 }
 
-// ETHPriceProvider is an optional interface for providers that can fetch ETH/USD price.
-// Typically implemented by CEX providers that have direct access to ETH price data.
-// Used to convert gas costs from wei to USD for profit calculations.
+// ETHPriceProvider fetches the current ETH/USD price.
+// Used for converting gas costs from wei to USD.
 type ETHPriceProvider interface {
+	// GetETHPrice returns the current ETH price in USD.
+	// Implementations should cache the result to avoid excessive API calls.
 	GetETHPrice(ctx context.Context) (float64, error)
 }
 
-// NotificationPublisher defines the interface for publishing arbitrage opportunities.
-// Implementations may publish to SNS, webhooks, logging systems, or other destinations.
-// The publisher should handle serialization, retries, and delivery confirmation.
+// NotificationPublisher publishes detected arbitrage opportunities.
+// Implementations may publish to SNS, SQS, webhooks, or other channels.
 type NotificationPublisher interface {
+	// PublishOpportunity sends an opportunity to the notification channel.
+	// Should be non-blocking; implementations may queue messages internally.
 	PublishOpportunity(ctx context.Context, opp *Opportunity) error
 }
 
-// CacheStore defines a minimal interface for caching operations.
-// Used by the detector to cache gas prices, quotes, and other expensive computations.
-// Implementations should be thread-safe and handle TTL expiration.
-type CacheStore interface {
-	// Get retrieves a value from cache. Returns cache.ErrNotFound if key doesn't exist.
-	Get(ctx context.Context, key string) (interface{}, error)
-	// Set stores a value with the specified TTL. TTL of 0 means no expiration.
-	Set(ctx context.Context, key string, val interface{}, ttl time.Duration) error
-}
-
-// Detector detects arbitrage opportunities between CEX and DEX
+// Detector orchestrates arbitrage detection for a single trading pair.
+// It coordinates price fetching from CEX and DEX providers, calculates
+// profit opportunities, and publishes profitable opportunities.
+//
+// The detector is designed for concurrent use and processes one block at a time.
+// For multiple trading pairs, create separate Detector instances.
 type Detector struct {
-	cexProvider     PriceProvider
-	dexProvider     PriceProvider
-	publisher       NotificationPublisher
-	calculator      *Calculator
-	cache           CacheStore
-	logger          *observability.Logger
-	metrics         *observability.Metrics
-	tradeSizes      []*big.Int
-	minProfitPct    float64
-	ethPriceUSD     float64
-	ethPriceMu      sync.RWMutex // Protects ethPriceUSD from concurrent access
-	tradingSymbol   string
-	dexQuoteLimiter *semaphore.Weighted
+	cexProvider  PriceProvider
+	publisher    NotificationPublisher
+	logger       *observability.Logger
+	metrics      *observability.Metrics
+	tracer       observability.Tracer
+	tradeSizes   []*big.Int
+	minProfitPct float64
+	ethPriceUSD  float64
+	ethPriceMu   sync.RWMutex
 
-	// Multi-pair support
-	pairName   string           // "ETH-USDC"
-	baseToken  config.TokenInfo // Base token (ETH, BTC, etc.)
-	quoteToken config.TokenInfo // Quote token (USDC, USDT, etc.)
+	pairName   string
+	baseToken  config.TokenInfo
+	quoteToken config.TokenInfo
 
-	// Gas price caching (reduce eth_gasPrice calls from 6/block to 1/12s)
-	ethClient      *ethclient.Client
-	cachedGasPrice *big.Int
-	gasPriceMu     sync.RWMutex
-	gasPriceExpiry time.Time
-	gasPriceTTL    time.Duration
-	maxGasPrice    *big.Int // Safety cap (500 gwei)
+	ethClient             *ethclient.Client
+	cachedGasPrice        *big.Int
+	previousGasPrice      *big.Int
+	gasPriceMu            sync.RWMutex
+	gasPriceExpiry        time.Time
+	gasPriceTTL           time.Duration
+	gasPriceTTLVolatile   time.Duration
+	gasPriceVolatilityPct float64
+	maxGasPrice           *big.Int
+
+	pipeline *Pipeline
 }
 
-// DetectorConfig holds detector configuration
+// DetectorConfig holds configuration for creating a Detector.
+// Required fields: CEXProvider, DEXProvider, Publisher.
 type DetectorConfig struct {
-	CEXProvider   PriceProvider
-	DEXProvider   PriceProvider
-	Publisher     NotificationPublisher
-	Cache         CacheStore
-	Logger        *observability.Logger
-	Metrics       *observability.Metrics
-	TradeSizes    []*big.Int
-	MinProfitPct  float64
-	ETHPriceUSD   float64
-	TradingSymbol string
-	EthClient     *ethclient.Client // For gas price fetching
-	// DEX quote concurrency limiter (shared across detectors)
-	DEXQuoteLimiter *semaphore.Weighted
-
-	// Multi-pair support
-	PairName   string           // "ETH-USDC", "BTC-USDC", etc.
-	BaseToken  config.TokenInfo // Base token metadata
-	QuoteToken config.TokenInfo // Quote token metadata
+	CEXProvider         PriceProvider
+	DEXProvider         PriceProvider
+	Publisher           NotificationPublisher
+	Logger              *observability.Logger
+	Metrics             *observability.Metrics
+	Tracer              observability.Tracer
+	TradeSizes          []*big.Int
+	MinProfitPct        float64
+	ETHPriceUSD         float64
+	EthClient           *ethclient.Client
+	DEXQuoteLimiter     *semaphore.Weighted
+	PairName            string
+	BaseToken           config.TokenInfo
+	QuoteToken          config.TokenInfo
+	PipelineConcurrency int
+	GasPriceConfig      config.GasPriceConfig
 }
 
-// NewDetector creates a new arbitrage detector
 func NewDetector(cfg DetectorConfig) (*Detector, error) {
 	if cfg.CEXProvider == nil {
 		return nil, fmt.Errorf("CEX provider is required")
@@ -123,54 +113,82 @@ func NewDetector(cfg DetectorConfig) (*Detector, error) {
 		return nil, fmt.Errorf("publisher is required")
 	}
 
-	// Set defaults
 	if cfg.MinProfitPct == 0 {
-		cfg.MinProfitPct = 0.5 // 0.5% minimum profit
+		cfg.MinProfitPct = 0.5
 	}
-	if cfg.ETHPriceUSD == 0 {
-		cfg.ETHPriceUSD = 2000 // Default ETH price
+	if cfg.PipelineConcurrency <= 0 {
+		cfg.PipelineConcurrency = 4
+	}
+	if cfg.Tracer == nil {
+		cfg.Tracer = observability.NewNoopTracer()
+	}
+	if cfg.GasPriceConfig.TTL == 0 {
+		cfg.GasPriceConfig.TTL = 12 * time.Second
+	}
+	if cfg.GasPriceConfig.VolatileTTL == 0 {
+		cfg.GasPriceConfig.VolatileTTL = 3 * time.Second
+	}
+	if cfg.GasPriceConfig.VolatilityThreshold == 0 {
+		cfg.GasPriceConfig.VolatilityThreshold = 0.20
 	}
 
-	// Set max gas price to 500 gwei (safety cap)
 	maxGasPrice := new(big.Int)
 	maxGasPrice.SetString("500000000000", 10) // 500 gwei
 
+	pipeline := NewPipeline(PipelineConfig{
+		CEXProvider:     cfg.CEXProvider,
+		DEXProvider:     cfg.DEXProvider,
+		Logger:          cfg.Logger,
+		Metrics:         cfg.Metrics,
+		Tracer:          cfg.Tracer,
+		DEXQuoteLimiter: cfg.DEXQuoteLimiter,
+		Concurrency:     cfg.PipelineConcurrency,
+		MinProfitPct:    cfg.MinProfitPct,
+	})
+
 	return &Detector{
-		cexProvider:     cfg.CEXProvider,
-		dexProvider:     cfg.DEXProvider,
-		publisher:       cfg.Publisher,
-		calculator:      NewCalculator(),
-		cache:           cfg.Cache,
-		logger:          cfg.Logger,
-		metrics:         cfg.Metrics,
-		tradeSizes:      cfg.TradeSizes,
-		minProfitPct:    cfg.MinProfitPct,
-		ethPriceUSD:     cfg.ETHPriceUSD,
-		tradingSymbol:   cfg.TradingSymbol,
-		dexQuoteLimiter: cfg.DEXQuoteLimiter,
-
-		// Multi-pair support
-		pairName:   cfg.PairName,
-		baseToken:  cfg.BaseToken,
-		quoteToken: cfg.QuoteToken,
-
-		// Gas price caching
-		ethClient:   cfg.EthClient,
-		gasPriceTTL: 12 * time.Second, // Cache for ~1 block
-		maxGasPrice: maxGasPrice,
+		cexProvider:           cfg.CEXProvider,
+		publisher:             cfg.Publisher,
+		logger:                cfg.Logger,
+		metrics:               cfg.Metrics,
+		tracer:                cfg.Tracer,
+		tradeSizes:            cfg.TradeSizes,
+		minProfitPct:          cfg.MinProfitPct,
+		ethPriceUSD:           cfg.ETHPriceUSD,
+		pairName:              cfg.PairName,
+		baseToken:             cfg.BaseToken,
+		quoteToken:            cfg.QuoteToken,
+		ethClient:             cfg.EthClient,
+		gasPriceTTL:           cfg.GasPriceConfig.TTL,
+		gasPriceTTLVolatile:   cfg.GasPriceConfig.VolatileTTL,
+		gasPriceVolatilityPct: cfg.GasPriceConfig.VolatilityThreshold,
+		maxGasPrice:           maxGasPrice,
+		pipeline:              pipeline,
 	}, nil
 }
 
-// getGasPrice fetches the current gas price with 12-second caching
-// This reduces eth_gasPrice calls from 6/block to 1 every 12 seconds
+func (d *Detector) isGasPriceVolatile(newPrice *big.Int) bool {
+	if d.previousGasPrice == nil || d.previousGasPrice.Cmp(big.NewInt(0)) == 0 {
+		return false
+	}
+
+	diff := new(big.Int).Sub(newPrice, d.previousGasPrice)
+	diff.Abs(diff)
+
+	diffFloat := new(big.Float).SetInt(diff)
+	prevFloat := new(big.Float).SetInt(d.previousGasPrice)
+	pctChange := new(big.Float).Quo(diffFloat, prevFloat)
+
+	pctChangeFloat, _ := pctChange.Float64()
+	return pctChangeFloat >= d.gasPriceVolatilityPct
+}
+
 func (d *Detector) getGasPrice(ctx context.Context) (*big.Int, error) {
-	// Return nil if no eth client configured (graceful degradation)
 	if d.ethClient == nil {
 		return nil, nil
 	}
 
 	d.gasPriceMu.RLock()
-	// Check if cached and not expired
 	if d.cachedGasPrice != nil && time.Now().Before(d.gasPriceExpiry) {
 		gasPrice := new(big.Int).Set(d.cachedGasPrice)
 		d.gasPriceMu.RUnlock()
@@ -181,23 +199,19 @@ func (d *Detector) getGasPrice(ctx context.Context) (*big.Int, error) {
 	}
 	d.gasPriceMu.RUnlock()
 
-	// Fetch fresh gas price
 	d.gasPriceMu.Lock()
 	defer d.gasPriceMu.Unlock()
 
-	// Double-check (another goroutine might have fetched)
 	if d.cachedGasPrice != nil && time.Now().Before(d.gasPriceExpiry) {
 		return new(big.Int).Set(d.cachedGasPrice), nil
 	}
 
-	// Fetch from network
 	gasPrice, err := d.ethClient.SuggestGasPrice(ctx)
 	if err != nil {
 		d.logger.Warn("failed to fetch gas price, will retry next block", "error", err)
 		return nil, fmt.Errorf("failed to get gas price: %w", err)
 	}
 
-	// Apply safety cap (max 500 gwei)
 	if gasPrice.Cmp(d.maxGasPrice) > 0 {
 		d.logger.Warn("gas price exceeds max, capping",
 			"actual_wei", gasPrice.String(),
@@ -205,9 +219,15 @@ func (d *Detector) getGasPrice(ctx context.Context) (*big.Int, error) {
 		gasPrice = new(big.Int).Set(d.maxGasPrice)
 	}
 
-	// Cache for 12 seconds
+	isVolatile := d.isGasPriceVolatile(gasPrice)
+	ttl := d.gasPriceTTL
+	if isVolatile {
+		ttl = d.gasPriceTTLVolatile
+	}
+
+	d.previousGasPrice = new(big.Int).Set(gasPrice)
 	d.cachedGasPrice = gasPrice
-	d.gasPriceExpiry = time.Now().Add(d.gasPriceTTL)
+	d.gasPriceExpiry = time.Now().Add(ttl)
 
 	gasPriceGwei := new(big.Float).Quo(
 		new(big.Float).SetInt(gasPrice),
@@ -218,13 +238,28 @@ func (d *Detector) getGasPrice(ctx context.Context) (*big.Int, error) {
 	d.logger.Info("fetched fresh gas price",
 		"gas_price_wei", gasPrice.String(),
 		"gas_price_gwei", gasPriceGweiFloat,
-		"cached_for", d.gasPriceTTL.Seconds())
+		"is_volatile", isVolatile,
+		"cached_for", ttl.Seconds())
 
 	return gasPrice, nil
 }
 
-// Detect detects arbitrage opportunities for a given block
+// Detect analyzes a block for arbitrage opportunities across all configured trade sizes.
+// It fetches prices from both CEX and DEX, calculates potential profits accounting for
+// gas costs and trading fees, and publishes profitable opportunities.
+//
+// Returns all detected opportunities (profitable or not) and any errors encountered.
+// Opportunities meeting the minimum profit threshold are automatically published.
 func (d *Detector) Detect(ctx context.Context, blockNum uint64, blockTime uint64) ([]*Opportunity, error) {
+	ctx, span := d.tracer.StartSpan(ctx, "Detector.Detect",
+		observability.WithAttributes(
+			attribute.String("pair", d.pairName),
+			attribute.Int64("block_number", int64(blockNum)),
+			attribute.Int("trade_sizes_count", len(d.tradeSizes)),
+		),
+	)
+	defer span.End()
+
 	start := time.Now()
 
 	d.logger.Info("detecting arbitrage opportunities",
@@ -233,41 +268,41 @@ func (d *Detector) Detect(ctx context.Context, blockNum uint64, blockTime uint64
 		"trade_sizes", len(d.tradeSizes),
 	)
 
-	// Fetch latest ETH price from Binance
 	latestETHPrice := d.fetchLatestETHPrice(ctx)
+	if latestETHPrice == 0 {
+		err := fmt.Errorf("ETH price unavailable: cannot calculate gas costs")
+		span.NoticeError(err)
+		d.logger.Error("cannot detect arbitrage: ETH price is unavailable",
+			"block_number", blockNum,
+			"impact", "skipping this block due to inability to calculate gas costs accurately")
+		return nil, err
+	}
 	if latestETHPrice != d.getETHPriceUSD() {
 		d.UpdateETHPrice(latestETHPrice)
 	}
 
-	// Fetch gas price ONCE per block (cached for 12s)
-	// This reduces eth_gasPrice calls from 6/block to 1 every 12 seconds
 	gasPrice, err := d.getGasPrice(ctx)
 	if err != nil {
 		d.logger.Warn("failed to get gas price, continuing with default estimate", "error", err)
-		// Continue without gas price - UniswapProvider will use default estimate
 	}
 
-	var opportunities []*Opportunity
+	opportunities := d.detectWithPipeline(ctx, blockNum, blockTime, gasPrice)
 
-	// Detect opportunities for each trade size
-	for _, tradeSize := range d.tradeSizes {
-		opps, err := d.detectForSize(ctx, blockNum, tradeSize, gasPrice)
-		if err != nil {
-			d.logger.LogError(ctx, "failed to detect opportunities for size", err,
-				"block_number", blockNum,
-				"trade_size", tradeSize.String(),
-			)
-			continue
-		}
-
-		opportunities = append(opportunities, opps...)
-	}
-
-	// Publish profitable opportunities
 	publishedCount := 0
 	for _, opp := range opportunities {
+		if opp.IsProfitable() {
+			attrs := []attribute.KeyValue{
+				attribute.String("opportunity_id", opp.OpportunityID),
+				attribute.String("direction", opp.Direction.String()),
+			}
+			if opp.ProfitPct != nil {
+				attrs = append(attrs, attribute.String("profit_pct", opp.ProfitPct.Text('f', 4)))
+			}
+			span.AddEvent("profitable_opportunity", attrs...)
+		}
 		if opp.IsProfitable() && opp.ProfitPct.Cmp(big.NewFloat(d.minProfitPct)) >= 0 {
 			if err := d.publisher.PublishOpportunity(ctx, opp); err != nil {
+				span.NoticeError(err)
 				d.logger.LogError(ctx, "failed to publish opportunity", err,
 					"opportunity_id", opp.OpportunityID,
 				)
@@ -277,7 +312,6 @@ func (d *Detector) Detect(ctx context.Context, blockNum uint64, blockTime uint64
 		}
 	}
 
-	// Record metrics
 	duration := time.Since(start)
 	if d.metrics != nil {
 		d.metrics.RecordBlockProcessing(ctx, duration)
@@ -293,257 +327,32 @@ func (d *Detector) Detect(ctx context.Context, blockNum uint64, blockTime uint64
 		"published", publishedCount,
 		"duration_ms", duration.Milliseconds(),
 	)
+	span.SetAttribute("opportunities_found", len(opportunities))
+	span.SetAttribute("published", publishedCount)
+	span.SetAttribute("duration_ms", duration.Milliseconds())
 
 	return opportunities, nil
 }
 
-// detectForSize detects opportunities for a specific trade size
-func (d *Detector) detectForSize(ctx context.Context, blockNum uint64, tradeSize *big.Int, gasPrice *big.Int) ([]*Opportunity, error) {
-	// Fetch prices from CEX and DEX in parallel
-	var cexBuyPrice, cexSellPrice, dexBuyPrice, dexSellPrice *pricing.Price
-	var cexBuyErr, cexSellErr, dexBuyErr, dexSellErr error
-
-	g, gctx := errgroup.WithContext(ctx)
-
-	// Fetch CEX buy price (when we BUY base on CEX)
-	// isBuy=true → uses Asks (sell orders, higher prices we pay to buy)
-	// CEX doesn't use gas price or block number
-	g.Go(func() error {
-		price, err := d.cexProvider.GetPrice(gctx, tradeSize, true, nil, blockNum)
-		if err != nil {
-			cexBuyErr = fmt.Errorf("CEX buy price: %w", err)
-			return nil
-		}
-		cexBuyPrice = price
-		return nil
-	})
-
-	// Fetch CEX sell price (when we SELL base on CEX)
-	// isBuy=false → uses Bids (buy orders, lower prices we receive when selling)
-	// CEX doesn't use gas price or block number
-	g.Go(func() error {
-		price, err := d.cexProvider.GetPrice(gctx, tradeSize, false, nil, blockNum)
-		if err != nil {
-			cexSellErr = fmt.Errorf("CEX sell price: %w", err)
-			return nil
-		}
-		cexSellPrice = price
-		return nil
-	})
-
-	// Fetch DEX buy price (when we BUY base on DEX)
-	// isToken0In=true → swap quote (token0) for base (token1)
-	// Pass cached gas price and block number (for caching)
-	g.Go(func() error {
-		if d.dexQuoteLimiter != nil {
-			if err := d.dexQuoteLimiter.Acquire(gctx, 1); err != nil {
-				dexBuyErr = fmt.Errorf("DEX buy price limiter: %w", err)
-				return nil
-			}
-			defer d.dexQuoteLimiter.Release(1)
-		}
-		price, err := d.dexProvider.GetPrice(gctx, tradeSize, true, gasPrice, blockNum)
-		if err != nil {
-			dexBuyErr = fmt.Errorf("DEX buy price: %w", err)
-			return nil
-		}
-		dexBuyPrice = price
-		return nil
-	})
-
-	// Fetch DEX sell price (when we SELL base on DEX)
-	// isToken0In=false → swap base (token1) for quote (token0)
-	// Pass cached gas price and block number (for caching)
-	g.Go(func() error {
-		if d.dexQuoteLimiter != nil {
-			if err := d.dexQuoteLimiter.Acquire(gctx, 1); err != nil {
-				dexSellErr = fmt.Errorf("DEX sell price limiter: %w", err)
-				return nil
-			}
-			defer d.dexQuoteLimiter.Release(1)
-		}
-		price, err := d.dexProvider.GetPrice(gctx, tradeSize, false, gasPrice, blockNum)
-		if err != nil {
-			dexSellErr = fmt.Errorf("DEX sell price: %w", err)
-			return nil
-		}
-		dexSellPrice = price
-		return nil
-	})
-
-	// Wait for all fetches to complete
-	if err := g.Wait(); err != nil {
-		return nil, fmt.Errorf("failed to fetch prices: %w", err)
-	}
-
-	var opportunities []*Opportunity
-
-	// If we couldn't fetch DEX prices, skip (can't compute opportunity)
-	if dexBuyPrice == nil || dexSellPrice == nil {
-		if dexBuyErr != nil {
-			return nil, dexBuyErr
-		}
-		if dexSellErr != nil {
-			return nil, dexSellErr
-		}
-		return nil, fmt.Errorf("failed to fetch DEX prices")
-	}
-
-	// Analyze CEX → DEX opportunity (buy on CEX, sell on DEX)
-	if cexBuyPrice != nil {
-		if oppCEXToDEX := d.analyzeOpportunity(ctx, blockNum, tradeSize, CEXToDEX, cexBuyPrice, dexSellPrice); oppCEXToDEX != nil {
-			opportunities = append(opportunities, oppCEXToDEX)
-		}
-	} else if cexBuyErr != nil {
-		d.logger.Debug("skipping CEX->DEX due to CEX buy error", "error", cexBuyErr, "trade_size", tradeSize.String())
-	}
-
-	// Analyze DEX → CEX opportunity (buy on DEX, sell on CEX)
-	if cexSellPrice != nil {
-		if oppDEXToCEX := d.analyzeOpportunity(ctx, blockNum, tradeSize, DEXToCEX, dexBuyPrice, cexSellPrice); oppDEXToCEX != nil {
-			opportunities = append(opportunities, oppDEXToCEX)
-		}
-	} else if cexSellErr != nil {
-		d.logger.Debug("skipping DEX->CEX due to CEX sell error", "error", cexSellErr, "trade_size", tradeSize.String())
-	}
-
-	return opportunities, nil
-}
-
-// analyzeOpportunity analyzes a single arbitrage opportunity
-func (d *Detector) analyzeOpportunity(
-	ctx context.Context,
-	blockNum uint64,
-	tradeSize *big.Int,
-	direction Direction,
-	buyPrice *pricing.Price,
-	sellPrice *pricing.Price,
-) *Opportunity {
-	// Calculate profit
-	// IMPORTANT: Calculator expects (cexPrice, dexPrice), not (buyPrice, sellPrice)
-	// We need to map correctly based on direction:
-	var cexPrice, dexPrice *pricing.Price
-	if direction == CEXToDEX {
-		// Buy on CEX, Sell on DEX
-		cexPrice = buyPrice  // CEX is where we buy
-		dexPrice = sellPrice // DEX is where we sell
-	} else {
-		// Buy on DEX, Sell on CEX
-		cexPrice = sellPrice // CEX is where we sell
-		dexPrice = buyPrice  // DEX is where we buy
-	}
-
-	profitMetrics, err := d.calculator.CalculateProfit(direction, tradeSize, cexPrice, dexPrice, d.getETHPriceUSD())
-	if err != nil {
-		d.logger.LogError(ctx, "failed to calculate profit", err,
-			"direction", direction.String(),
-			"trade_size", tradeSize.String(),
-		)
-		return nil
-	}
-	if profitMetrics.ValidationWarning != "" {
-		d.logger.Warn("profit calculation warning",
-			"warning", profitMetrics.ValidationWarning,
-			"direction", direction.String(),
-			"trade_size", tradeSize.String(),
-			"cex_price", cexPrice.Value.Text('f', 2),
-			"dex_price", dexPrice.Value.Text('f', 2),
-		)
-	}
-
-	// Create opportunity
-	opp := NewOpportunity(blockNum, direction, tradeSize)
-	opp.TradingPair = d.pairName
-	opp.SetBaseInfo(d.baseToken.Symbol, d.quoteToken.Symbol, d.baseToken.Decimals)
-
-	// Set prices (use cexPrice, dexPrice - already mapped correctly above)
-	opp.SetPrices(cexPrice.Value, dexPrice.Value)
-
-	// Set profit metrics
-	opp.SetProfitMetrics(
-		profitMetrics.GrossProfitUSD,
-		profitMetrics.NetProfitUSD,
-		profitMetrics.ProfitPct,
+func (d *Detector) detectWithPipeline(ctx context.Context, blockNum uint64, blockTime uint64, gasPrice *big.Int) []*Opportunity {
+	return d.pipeline.Process(
+		ctx,
+		blockNum,
+		blockTime,
+		d.tradeSizes,
+		gasPrice,
+		d.getETHPriceUSD(),
+		d.pairName,
+		d.baseToken.Symbol,
+		d.baseToken.Decimals,
+		d.quoteToken.Symbol,
 	)
-
-	// Set costs (gas is only paid on DEX side)
-	var gasCost *big.Int
-	if direction == CEXToDEX {
-		// Buy on CEX (no gas), Sell on DEX (pay gas)
-		gasCost = sellPrice.GasCost
-	} else {
-		// Buy on DEX (pay gas), Sell on CEX (no gas)
-		gasCost = buyPrice.GasCost
-	}
-	opp.SetCosts(gasCost, profitMetrics.GasCostUSD, profitMetrics.TradingFeesUSD)
-
-	// Add execution steps
-	if direction == CEXToDEX {
-		opp.AddExecutionStep(fmt.Sprintf("Buy %s %s on Binance at $%s", formatBigFloat(opp.TradeSizeBase, 4), opp.BaseSymbol, buyPrice.Value.Text('f', 2)))
-		opp.AddExecutionStep(fmt.Sprintf("Transfer %s to wallet (if needed)", opp.BaseSymbol))
-		opp.AddExecutionStep(fmt.Sprintf("Sell %s %s on Uniswap at $%s", formatBigFloat(opp.TradeSizeBase, 4), opp.BaseSymbol, sellPrice.Value.Text('f', 2)))
-		opp.AddExecutionStep(fmt.Sprintf("Pay gas cost: %s wei", gasCost.String()))
-	} else {
-		opp.AddExecutionStep(fmt.Sprintf("Buy %s %s on Uniswap at $%s", formatBigFloat(opp.TradeSizeBase, 4), opp.BaseSymbol, buyPrice.Value.Text('f', 2)))
-		opp.AddExecutionStep(fmt.Sprintf("Pay gas cost: %s wei", gasCost.String()))
-		opp.AddExecutionStep(fmt.Sprintf("Transfer %s to Binance (if needed)", opp.BaseSymbol))
-		opp.AddExecutionStep(fmt.Sprintf("Sell %s %s on Binance at $%s", formatBigFloat(opp.TradeSizeBase, 4), opp.BaseSymbol, sellPrice.Value.Text('f', 2)))
-	}
-
-	// Add risk factors
-	if buyPrice.Slippage.Cmp(big.NewFloat(0.5)) > 0 {
-		opp.AddRiskFactor(fmt.Sprintf("High buy slippage: %s%%", buyPrice.Slippage.Text('f', 2)))
-	}
-	if sellPrice.Slippage.Cmp(big.NewFloat(0.5)) > 0 {
-		opp.AddRiskFactor(fmt.Sprintf("High sell slippage: %s%%", sellPrice.Slippage.Text('f', 2)))
-	}
-	if profitMetrics.GasCostUSD.Cmp(big.NewFloat(50)) > 0 {
-		opp.AddRiskFactor(fmt.Sprintf("High gas cost: $%s", profitMetrics.GasCostUSD.Text('f', 2)))
-	}
-	if direction == CEXToDEX || direction == DEXToCEX {
-		opp.AddRiskFactor("Requires cross-exchange transfer (time risk)")
-	}
-
-	// Log opportunity with debug fields
-	if opp.IsProfitable() {
-		// Log basic opportunity info
-		d.logger.Info("profitable opportunity found",
-			"opportunity_id", opp.OpportunityID,
-			"direction", direction.String(),
-			"net_profit_usd", profitMetrics.NetProfitUSD.Text('f', 2),
-			"profit_pct", profitMetrics.ProfitPct.Text('f', 4),
-		)
-
-		// Log detailed debug fields for profit calculation validation
-		if profitMetrics.DebugFields != nil {
-			d.logger.Info("profit calculation debug",
-				"trade_size_base", profitMetrics.DebugFields["trade_size_base"],
-				"cex_price", profitMetrics.DebugFields["cex_price"],
-				"dex_price", profitMetrics.DebugFields["dex_price"],
-				"usdc_spent", profitMetrics.DebugFields["usdc_spent"],
-				"usdc_received", profitMetrics.DebugFields["usdc_received"],
-				"cex_amount_out_normalized", profitMetrics.DebugFields["cex_amount_out_normalized"],
-				"dex_amount_out_normalized", profitMetrics.DebugFields["dex_amount_out_normalized"],
-				"cex_amount_out_raw", profitMetrics.DebugFields["cex_amount_out_raw"],
-				"dex_amount_out_raw", profitMetrics.DebugFields["dex_amount_out_raw"],
-				"gross_profit_usdc", profitMetrics.DebugFields["gross_profit_usdc"],
-				"gas_cost_usdc", profitMetrics.DebugFields["gas_cost_usdc"],
-				"trading_fees_usdc", profitMetrics.DebugFields["trading_fees_usdc"],
-				"net_profit_usdc", profitMetrics.DebugFields["net_profit_usdc"],
-				"expected_profit_approx", profitMetrics.DebugFields["expected_profit_approx"],
-			)
-		}
-	}
-
-	return opp
 }
 
-// GetTradeSizes returns configured trade sizes
 func (d *Detector) GetTradeSizes() []*big.Int {
 	return d.tradeSizes
 }
 
-// UpdateETHPrice updates the ETH price used for calculations (thread-safe)
 func (d *Detector) UpdateETHPrice(priceUSD float64) {
 	d.ethPriceMu.Lock()
 	d.ethPriceUSD = priceUSD
@@ -551,26 +360,26 @@ func (d *Detector) UpdateETHPrice(priceUSD float64) {
 
 	d.logger.Info("updated ETH price", "price_usd", priceUSD)
 
-	// Record ETH price metric
 	if d.metrics != nil {
 		d.metrics.RecordETHPrice(context.Background(), priceUSD)
 	}
 }
 
-// getETHPriceUSD returns the current ETH price in USD (thread-safe)
 func (d *Detector) getETHPriceUSD() float64 {
 	d.ethPriceMu.RLock()
 	defer d.ethPriceMu.RUnlock()
 	return d.ethPriceUSD
 }
 
-// fetchLatestETHPrice fetches the latest ETH price from the CEX provider
-// Returns the last known price if fetching fails or provider doesn't support it
 func (d *Detector) fetchLatestETHPrice(ctx context.Context) float64 {
-	// Check if CEX provider implements ETHPriceProvider interface
 	ethProvider, ok := d.cexProvider.(ETHPriceProvider)
 	if !ok {
 		cachedPrice := d.getETHPriceUSD()
+		if cachedPrice == 0 {
+			d.logger.Error("no ETH price available and CEX provider does not support ETH price fetching",
+				"impact", "gas cost calculations will be incorrect")
+			return 0
+		}
 		d.logger.Debug("CEX provider does not support ETH price fetching, using cached price", "cached_price", cachedPrice)
 		return cachedPrice
 	}
@@ -578,6 +387,12 @@ func (d *Detector) fetchLatestETHPrice(ctx context.Context) float64 {
 	price, err := ethProvider.GetETHPrice(ctx)
 	if err != nil {
 		cachedPrice := d.getETHPriceUSD()
+		if cachedPrice == 0 {
+			d.logger.Error("failed to fetch initial ETH price from CEX, no fallback available",
+				"error", err,
+				"impact", "gas cost calculations will be incorrect until price is fetched successfully")
+			return 0
+		}
 		d.logger.Warn("failed to fetch ETH price, using cached price",
 			"error", err,
 			"cached_price", cachedPrice)
@@ -585,4 +400,10 @@ func (d *Detector) fetchLatestETHPrice(ctx context.Context) float64 {
 	}
 
 	return price
+}
+
+func (d *Detector) Close() {
+	if d.pipeline != nil {
+		d.pipeline.Close()
+	}
 }

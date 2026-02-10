@@ -15,6 +15,7 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // PoolState represents the current state of a Uniswap V3 pool
@@ -48,6 +49,7 @@ type UniswapProvider struct {
 	cache             cache.Cache
 	logger            *observability.Logger
 	metrics           *observability.Metrics
+	tracer            observability.Tracer
 	feeTiers          []uint32                // Multiple fee tiers to try (e.g., [100, 500, 3000, 10000])
 	quoterRateLimiter *resilience.RateLimiter // Rate limiter for QuoterV2 calls
 	retryCfg          resilience.RetryConfig
@@ -70,6 +72,7 @@ type UniswapProviderConfig struct {
 	Cache          cache.Cache
 	Logger         *observability.Logger
 	Metrics        *observability.Metrics
+	Tracer         observability.Tracer
 	FeeTiers       []uint32 // Multiple fee tiers to try
 	RateLimitRPM   int      // Rate limit: requests per minute for QuoterV2 calls (default 300)
 	RateLimitBurst int      // Rate limit: burst size (default 20)
@@ -217,6 +220,9 @@ func NewUniswapProvider(cfg UniswapProviderConfig) (*UniswapProvider, error) {
 	if len(cfg.FeeTiers) == 0 {
 		cfg.FeeTiers = []uint32{3000} // Default 0.3% fee if not specified
 	}
+	if cfg.Tracer == nil {
+		cfg.Tracer = observability.NewNoopTracer()
+	}
 
 	// Set rate limit defaults (conservative for Infura free tier)
 	if cfg.RateLimitRPM == 0 {
@@ -287,6 +293,7 @@ func NewUniswapProvider(cfg UniswapProviderConfig) (*UniswapProvider, error) {
 		cache:             cfg.Cache,
 		logger:            cfg.Logger,
 		metrics:           cfg.Metrics,
+		tracer:            cfg.Tracer,
 		feeTiers:          cfg.FeeTiers,
 		quoterRateLimiter: rateLimiter,
 		retryCfg:          cfg.RetryConfig,
@@ -304,6 +311,18 @@ func NewUniswapProvider(cfg UniswapProviderConfig) (*UniswapProvider, error) {
 // If provided (cached from detector), uses it directly (efficient)
 // blockNum is used for per-block caching to reduce RPC calls
 func (u *UniswapProvider) GetPrice(ctx context.Context, size *big.Int, isToken0In bool, gasPrice *big.Int, blockNum uint64) (*Price, error) {
+	direction := map[bool]string{true: "buy", false: "sell"}[isToken0In]
+	ctx, span := u.tracer.StartSpan(
+		ctx,
+		"Uniswap.GetPrice",
+		observability.WithAttributes(
+			attribute.String("direction", direction),
+			attribute.String("pair", u.pairName),
+			attribute.String("size", size.String()),
+		),
+	)
+	defer span.End()
+
 	start := time.Now()
 
 	// Try all fee tiers and pick the best execution price
@@ -344,8 +363,11 @@ func (u *UniswapProvider) GetPrice(ctx context.Context, size *big.Int, isToken0I
 	}
 
 	if bestPrice == nil {
-		return nil, fmt.Errorf("all fee tier quotes failed")
+		err := fmt.Errorf("all fee tier quotes failed")
+		span.NoticeError(err)
+		return nil, err
 	}
+	span.SetAttribute("best_fee_tier", int64(bestPrice.FeeTier))
 
 	// Record metrics for fee tier selection
 	if u.metrics != nil {
@@ -365,6 +387,17 @@ func (u *UniswapProvider) GetPrice(ctx context.Context, size *big.Int, isToken0I
 
 // getPriceForFeeTier fetches price for a specific fee tier with per-block caching
 func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int, isToken0In bool, gasPrice *big.Int, feeTier uint32, blockNum uint64) (*Price, error) {
+	direction := map[bool]string{true: "buy", false: "sell"}[isToken0In]
+	ctx, span := u.tracer.StartSpan(
+		ctx,
+		"Uniswap.GetQuote",
+		observability.WithAttributes(
+			attribute.Int64("fee_tier", int64(feeTier)),
+			attribute.String("direction", direction),
+		),
+	)
+	defer span.End()
+
 	start := time.Now()
 
 	// Build cache key (includes block number for per-block TTL)
@@ -374,6 +407,8 @@ func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int,
 	if u.cache != nil {
 		if cached, err := u.cache.Get(ctx, cacheKey); err == nil {
 			if price, ok := cached.(*Price); ok {
+				span.SetAttribute("cache_hit", true)
+				setQuoteSpanAmounts(span, size, price, isToken0In)
 				u.logger.Debug("cache hit for DEX quote",
 					"block", blockNum,
 					"fee_tier", feeTier,
@@ -392,6 +427,7 @@ func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int,
 			}
 		}
 	}
+	span.SetAttribute("cache_hit", false)
 
 	// PRODUCTION-READY: Use QuoterV2 for accurate price quotes
 	// QuoterV2 handles all the complex Uniswap V3 math internally:
@@ -405,6 +441,9 @@ func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int,
 	var tokenIn, tokenOut common.Address
 	var result []interface{}
 	callOpts := &bind.CallOpts{Context: ctx}
+	if blockNum > 0 {
+		callOpts.BlockNumber = new(big.Int).SetUint64(blockNum)
+	}
 
 	// Track QuoterV2 call timing
 	quoterStart := time.Now()
@@ -452,6 +491,7 @@ func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int,
 
 		quoterErr = callQuoter("quoteExactOutputSingle", params)
 		if quoterErr != nil {
+			span.NoticeError(quoterErr)
 			// Record failed QuoterV2 call
 			if u.metrics != nil {
 				u.metrics.RecordQuoterCall(ctx, feeTier, "error", time.Since(quoterStart))
@@ -482,6 +522,7 @@ func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int,
 
 		quoterErr = callQuoter("quoteExactInputSingle", params)
 		if quoterErr != nil {
+			span.NoticeError(quoterErr)
 			// Record failed QuoterV2 call
 			if u.metrics != nil {
 				u.metrics.RecordQuoterCall(ctx, feeTier, "error", time.Since(quoterStart))
@@ -503,32 +544,43 @@ func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int,
 	gasEstimate := result[3].(*big.Int)
 
 	var amountOutQuote *big.Float
-	var effectivePrice *big.Float
 	var amountOutBase *big.Float // For logging
+	var priceImpact PriceImpact
 
 	if isToken0In {
 		// Buying base with quote: used quoteExactOutputSingle
 		// firstAmount is the quote input required
 		// size is the base output (what we requested)
-		quoteSpent := rawToFloat(firstAmount, u.token0Decimals)
 		amountOutBase = rawToFloat(size, u.token1Decimals)
 
-		// Price = quote spent / base received
-		effectivePrice = new(big.Float).Quo(quoteSpent, amountOutBase)
-		amountOutQuote = quoteSpent
+		// Calculate price impact from actual amounts
+		priceImpact = CalculatePriceImpact(
+			firstAmount, size, // amountIn (quote), amountOut (base)
+			u.token0Decimals, u.token1Decimals,
+			true, // isBuying
+			ticksCrossed,
+			gasEstimate,
+		)
+		amountOutQuote = rawToFloat(firstAmount, u.token0Decimals)
 	} else {
 		// Selling base for quote: used quoteExactInputSingle
 		// firstAmount is the quote output received
 		// size is the base input
 		amountOutQuote = rawToFloat(firstAmount, u.token0Decimals)
-		amountInBase := rawToFloat(size, u.token1Decimals)
 
-		effectivePrice = new(big.Float).Quo(amountOutQuote, amountInBase)
+		// Calculate price impact from actual amounts
+		priceImpact = CalculatePriceImpact(
+			size, firstAmount, // amountIn (base), amountOut (quote)
+			u.token1Decimals, u.token0Decimals,
+			false, // isSelling
+			ticksCrossed,
+			gasEstimate,
+		)
 	}
 
-	// Calculate slippage from sqrtPriceAfter (price impact percentage)
-	// This requires getting current price first - for now use ticks crossed as proxy
-	slippagePct := float64(ticksCrossed) * 0.01 // Rough estimate: 0.01% per tick
+	// Use effective price from price impact calculation
+	effectivePrice := priceImpact.EffectivePrice
+	slippagePct := priceImpact.ImpactBPS.Float64() / 100 // Convert BPS to percentage
 
 	// Calculate gas cost
 	var gasCost *big.Int
@@ -540,6 +592,7 @@ func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int,
 		var err error
 		gasCost, err = u.EstimateGasCost(ctx, size, isToken0In)
 		if err != nil {
+			span.NoticeError(err)
 			u.logger.Warn("failed to estimate gas cost", "error", err)
 			// Use QuoterV2's gas estimate with default 50 gwei
 			gasCost = new(big.Int).Mul(gasEstimate, big.NewInt(50e9))
@@ -614,6 +667,7 @@ func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int,
 	if u.cache != nil {
 		ttl := 15 * time.Second
 		if err := u.cache.Set(ctx, cacheKey, price, ttl); err != nil {
+			span.NoticeError(err)
 			u.logger.Warn("failed to cache DEX quote", "error", err)
 		} else {
 			u.logger.Debug("cached DEX quote",
@@ -624,7 +678,24 @@ func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int,
 		}
 	}
 
+	setQuoteSpanAmounts(span, size, price, isToken0In)
 	return price, nil
+}
+
+func setQuoteSpanAmounts(span observability.Span, size *big.Int, price *Price, isToken0In bool) {
+	if span == nil || size == nil || price == nil || price.AmountOutRaw == nil {
+		return
+	}
+
+	amountIn := size
+	amountOut := price.AmountOutRaw
+	if isToken0In {
+		amountIn = price.AmountOutRaw
+		amountOut = size
+	}
+
+	span.SetAttribute("amount_in", amountIn.String())
+	span.SetAttribute("amount_out", amountOut.String())
 }
 
 // GetPoolState fetches the current state of the Uniswap V3 pool

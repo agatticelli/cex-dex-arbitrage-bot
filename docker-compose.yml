@@ -15,35 +15,6 @@ services:
     networks:
       - arbitrage-local
 
-  localstack:
-    image: localstack/localstack:latest
-    container_name: arbitrage-localstack
-    ports:
-      - "4566:4566"  # LocalStack gateway
-      - "4571:4571"  # LocalStack dashboard (optional)
-    environment:
-      - SERVICES=sns,sqs,dynamodb,lambda,ses
-      - DEBUG=1
-      - LAMBDA_EXECUTOR=docker-reuse
-      - DOCKER_HOST=unix:///var/run/docker.sock
-      - PERSISTENCE=1
-      - AWS_DEFAULT_REGION=us-east-1
-      - AWS_ACCESS_KEY_ID=test
-      - AWS_SECRET_ACCESS_KEY=test
-    volumes:
-      - "./scripts/localstack:/etc/localstack/init/ready.d"
-      - "./bin/lambdas:/tmp/lambdas"
-      - "/var/run/docker.sock:/var/run/docker.sock"
-      - localstack-data:/var/lib/localstack
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    networks:
-      - arbitrage-local
-
   prometheus:
     image: prom/prometheus:latest
     container_name: arbitrage-prometheus
@@ -97,6 +68,7 @@ services:
       - GF_INSTALL_PLUGINS=
     volumes:
       - ./observability/grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
+      - ./observability/grafana/provisioning/dashboards/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml
       - ./observability/grafana/dashboards:/var/lib/grafana/dashboards
       - grafana-data:/var/lib/grafana
     healthcheck:
@@ -123,8 +95,6 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      localstack:
-        condition: service_healthy
       jaeger:
         condition: service_healthy
     restart: unless-stopped
@@ -145,8 +115,6 @@ networks:
 volumes:
   redis-data:
     name: arbitrage-redis-data
-  localstack-data:
-    name: arbitrage-localstack-data
   prometheus-data:
     name: arbitrage-prometheus-data
   grafana-data:

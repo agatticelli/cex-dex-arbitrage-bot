@@ -15,13 +15,34 @@ type TokenInfo struct {
 
 // TokenRegistry maps token symbols to their on-chain information
 // This is a hardcoded registry of well-known tokens on Ethereum mainnet
-//
-// IMPORTANT: This system only supports ETH-X pairs (ETH as base token)
-// because gas costs are paid in ETH and profit calculations assume ETH as the base asset.
 var TokenRegistry = map[string]TokenInfo{
 	"ETH": {
 		Symbol:       "ETH",
 		Address:      "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", // WETH
+		Decimals:     18,
+		IsStablecoin: false,
+	},
+	"WBTC": {
+		Symbol:       "WBTC",
+		Address:      "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
+		Decimals:     8,
+		IsStablecoin: false,
+	},
+	"LINK": {
+		Symbol:       "LINK",
+		Address:      "0x514910771AF9Ca656af840dff83E8264EcF986CA",
+		Decimals:     18,
+		IsStablecoin: false,
+	},
+	"UNI": {
+		Symbol:       "UNI",
+		Address:      "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984",
+		Decimals:     18,
+		IsStablecoin: false,
+	},
+	"AAVE": {
+		Symbol:       "AAVE",
+		Address:      "0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9",
 		Decimals:     18,
 		IsStablecoin: false,
 	},
@@ -48,14 +69,11 @@ var TokenRegistry = map[string]TokenInfo{
 // ParsePair parses a trading pair string like "ETH-USDC" into base and quote token info
 // Returns the base token (left side), quote token (right side), and any error
 //
-// IMPORTANT: Only ETH-X pairs are supported (ETH must be the base token).
-// This is because:
-//   - Gas costs are paid in ETH on Ethereum mainnet
-//   - Profit calculations assume ETH as the base asset
-//   - The system uses ethPriceUSD for gas cost conversions
+// Supported base tokens: ETH, WBTC, LINK, UNI, AAVE
+// Supported quote tokens: USDC, USDT, DAI
 //
-// Supported pairs: ETH-USDC, ETH-USDT, ETH-DAI
-// NOT supported: BTC-USDC, USDC-ETH, etc.
+// Note: On Ethereum mainnet, gas is always paid in ETH regardless of trading pair.
+// The system fetches ETH price separately for gas cost calculations.
 //
 // Example: ParsePair("ETH-USDC") returns:
 //   - base:  TokenInfo{Symbol: "ETH", Address: "0xC02a...", Decimals: 18}
@@ -68,21 +86,21 @@ func ParsePair(pairName string) (base TokenInfo, quote TokenInfo, err error) {
 
 	baseSymbol, quoteSymbol := parts[0], parts[1]
 
-	// VALIDATION: Base token must be ETH
-	if baseSymbol != "ETH" {
-		return TokenInfo{}, TokenInfo{}, fmt.Errorf("invalid base token: %s (only ETH-X pairs are supported, e.g. ETH-USDC, ETH-USDT, ETH-DAI)", baseSymbol)
-	}
-
 	// Lookup base token
 	base, ok := TokenRegistry[baseSymbol]
 	if !ok {
-		return TokenInfo{}, TokenInfo{}, fmt.Errorf("unknown base token: %s (supported: ETH)", baseSymbol)
+		return TokenInfo{}, TokenInfo{}, fmt.Errorf("unknown base token: %s (supported: ETH, WBTC, LINK, UNI, AAVE)", baseSymbol)
 	}
 
 	// Lookup quote token
 	quote, ok = TokenRegistry[quoteSymbol]
 	if !ok {
 		return TokenInfo{}, TokenInfo{}, fmt.Errorf("unknown quote token: %s (supported: USDC, USDT, DAI)", quoteSymbol)
+	}
+
+	// Validate that base and quote are different
+	if baseSymbol == quoteSymbol {
+		return TokenInfo{}, TokenInfo{}, fmt.Errorf("base and quote tokens must be different: %s", pairName)
 	}
 
 	return base, quote, nil

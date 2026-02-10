@@ -38,14 +38,6 @@ config.yaml
 *~
 .DS_Store
 
-# Lambda build artifacts
-lambdas/*/bootstrap
-lambdas/*/function.zip
-lambdas/*/*.zip
-
-# Docker volumes
-localstack-data/
-
 # Kubernetes secrets
 k8s/**/secret.yaml
 k8s/**/*-secret.yaml
@@ -65,11 +57,7 @@ build/
 # OS files
 Thumbs.db
 
-# LocalStack persistence
-.localstack/
-
-# Prometheus data
+# Docker volume data (local)
 prometheus-data/
-
-# Grafana data
 grafana-data/
+redis-data/

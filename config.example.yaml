@@ -1,173 +1,75 @@
 # CEX-DEX Arbitrage Bot Configuration
-# Copy this file to config.yaml and update with your settings
-#
-# ===== TOKEN REGISTRY =====
-# The system includes a built-in token registry with well-known ERC-20 tokens.
-# No need to manually specify token addresses - just use pair names like "ETH-USDC"!
-#
-# IMPORTANT: Only ETH-X pairs are supported (ETH must be the base token).
-# This is because gas costs are paid in ETH and profit calculations assume ETH as base.
-#
-# Supported pairs: ETH-USDC, ETH-USDT, ETH-DAI
-# NOT supported: BTC-USDC, USDC-ETH, etc.
-#
-# Token addresses (internal/platform/config/token_registry.go):
-#   - ETH  (WETH): 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 (18 decimals)
-#   - USDC:        0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 (6 decimals)
-#   - USDT:        0xdAC17F958D2ee523a2206206994597C13D831ec7 (6 decimals)
-#   - DAI:         0x6B175474E89094C44Da98b954EedeAC495271d0F (18 decimals)
-#
-# To add a new quote token (X in ETH-X):
-#   1. Update internal/platform/config/token_registry.go
-#   2. Add TokenInfo entry with symbol, address, decimals
-#   3. Restart the detector
-#
-# ===== GETTING STARTED =====
-# 1. Replace YOUR_INFURA_KEY and YOUR_ALCHEMY_KEY with your actual API keys
-# 2. Configure trading pairs in the 'arbitrage.pairs' section below
-# 3. Adjust rate limits based on your RPC provider plan
-# 4. For production, remove 'aws.endpoint' to use real AWS (not LocalStack)
+# Copy this file to config.yaml and add your API keys
 
-# ===== ENVIRONMENT OVERRIDES (recommended for secrets) =====
-# Prefix: ARB_ (case-sensitive)
-#
-# Examples:
-#   export ARB_ETHEREUM_WEBSOCKET_URLS="wss://mainnet.infura.io/ws/v3/KEY,wss://eth-mainnet.g.alchemy.com/v2/KEY"
-#   export ARB_ETHEREUM_RPC_ENDPOINTS="https://mainnet.infura.io/v3/KEY|1,https://eth-mainnet.g.alchemy.com/v2/KEY|1"
-#   export ARB_AWS_SNS_TOPIC_ARN="arn:aws:sns:us-east-1:123456789012:arbitrage-opportunities"
-#   export ARB_REDIS_PASSWORD="super-secret"
-#   export ARB_ARBITRAGE_TRADE_SIZES="1,10,100"
-#   export ARB_ARBITRAGE_PAIRS="ETH-USDC,ETH-USDT"
-#
-# Notes:
-# - RPC endpoints support optional weights using "url|weight".
-# - Values are comma-separated.
-
-# Ethereum blockchain configuration
 ethereum:
-  # WebSocket URLs for real-time block subscription (required)
-  # Get your API keys from https://infura.io or https://alchemy.com
   websocket_urls:
     - "wss://mainnet.infura.io/ws/v3/YOUR_INFURA_KEY"
-    - "wss://eth-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY"
+    # - "wss://eth-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY"
 
-  # RPC endpoints for contract calls and failover (required)
   rpc_endpoints:
     - url: "https://mainnet.infura.io/v3/YOUR_INFURA_KEY"
       weight: 1
-    - url: "https://eth-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY"
-      weight: 1
+    # - url: "https://eth-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY"
+    #   weight: 1
 
-  # Reconnection settings for WebSocket
   reconnect:
     max_backoff: 30s
     base_delay: 1s
     max_delay: 30s
     jitter: 0.2
 
-# Exchange configuration
 exchanges:
   binance:
     base_url: "https://api.binance.com"
     rate_limit:
-      requests_per_minute: 1200  # Binance API limit
+      requests_per_minute: 1200
       burst: 50
-    trading_fee: 0.001  # 0.1% fee
+    trading_fee: 0.001
 
-# Uniswap V3 configuration
 uniswap:
-  # QuoterV2 contract address (for accurate price quotes)
   quoter_address: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
-
-  # Fee tiers to try: [100=0.01%, 500=0.05%, 3000=0.3%, 10000=1%]
-  # For Infura free tier (100k req/day), use only [500, 3000] to stay under rate limits
-  # For paid RPC providers (Alchemy, Infura paid), use all 4: [100, 500, 3000, 10000]
   fee_tiers: [500, 3000]
-
-  # Rate limiting for QuoterV2 calls (to avoid hitting RPC provider limits)
   rate_limit:
-    requests_per_minute: 60  # Conservative limit for Infura free tier (~69 RPM sustained)
-    burst: 12                # Allow bursts up to 12 (2 fee tiers × 2 directions × 3 trade sizes)
+    requests_per_minute: 60
+    burst: 12
 
-# Arbitrage detection settings
 arbitrage:
-  # ===== SIMPLIFIED MULTI-PAIR CONFIGURATION =====
-  # Just list trading pairs - token addresses are handled automatically by the registry!
-  #
-  # IMPORTANT: Only ETH-X pairs are supported (ETH must be base token)
-  # Valid examples: ETH-USDC, ETH-USDT, ETH-DAI
-  # Invalid examples: BTC-USDC, USDC-ETH (will fail validation)
-  #
-  # Why ETH-only?
-  #   - Gas costs are paid in ETH on Ethereum mainnet
-  #   - Profit calculations use ethPriceUSD for gas cost conversions
-  #   - System designed specifically for WETH arbitrage
   pairs:
     - "ETH-USDC"
-    # - "ETH-USDT"  # Uncomment to add more ETH pairs
-    # - "ETH-DAI"   # Uncomment to add DAI pair
-
-  # Optional: Override defaults for specific pairs
-  # pair_overrides:
-  #   ETH-USDT:
-  #     trade_sizes:
-  #       - "0.5"                  # 0.5 ETH (human-readable)
-  #       - "2"                    # 2 ETH
-  #     min_profit_threshold: 0.3
-
-  # Global concurrency limit for DEX quotes (across all pairs)
+    # - "ETH-USDT"
+    # - "ETH-DAI"
   max_concurrent_dex_quotes: 8
-
-  # Trade sizes (human-readable base units)
   trade_sizes:
-    - "1"                     # 1 ETH
-    - "10"                    # 10 ETH
-    - "100"                   # 100 ETH
+    - "1"
+    - "10"
+    - "100"
+  min_profit_threshold: 0.5
 
-  # Minimum profit threshold (percentage)
-  # Only opportunities above this threshold will be published
-  min_profit_threshold: 0.5  # 0.5%
-
-# Redis configuration (for caching)
 redis:
-  address: "localhost:6379"
+  address: "redis:6379"
   password: ""
   db: 0
 
-# AWS services configuration
+# AWS SNS (optional) - when configured, opportunities are published to SNS
+# Remove sns_topic_arn to use NoOp publisher (logs only)
 aws:
-  # LocalStack endpoint for local development
-  # For production, remove this line to use real AWS
-  endpoint: "http://localhost:4566"
   region: "us-east-1"
+  # sns_topic_arn: "arn:aws:sns:us-east-1:123456789012:arbitrage-opportunities"
 
-  # SNS topic ARN for publishing opportunities
-  # LocalStack format: arn:aws:sns:us-east-1:000000000000:arbitrage-opportunities
-  # Production format: arn:aws:sns:us-east-1:YOUR_ACCOUNT_ID:arbitrage-opportunities
-  sns_topic_arn: "arn:aws:sns:us-east-1:000000000000:arbitrage-opportunities"
-
-# Cache configuration
 cache:
-  l1_max_size: 1000  # In-memory cache max entries
-  l2_ttl: 60s        # Redis cache TTL
+  l1_max_size: 1000
+  l2_ttl: 60s
 
-# Observability configuration
 observability:
-  # Logging settings
   logging:
-    level: "info"  # debug, info, warn, error
-    format: "json"  # json or text
-
-  # Metrics settings
-  # Note: Metrics are exposed on the main HTTP server port (/metrics endpoint)
+    level: "info"
+    format: "json"
   metrics:
     enabled: true
-
-  # Distributed tracing settings
+    port: 9090
   tracing:
     enabled: true
-    endpoint: "localhost:4317"  # OTLP gRPC endpoint (Jaeger)
+    endpoint: "jaeger:4317"
 
-# HTTP server configuration
 http:
-  port: 8080  # Health checks and metrics endpoint
+  port: 8080

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/big"
 	"net/http"
 	"os"
 	"os/signal"
@@ -20,68 +19,9 @@ import (
 	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/config"
 	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/observability"
 	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/pricing"
+	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/sync/semaphore"
 )
-
-// binanceAdapter adapts BinanceProvider to arbitrage.PriceProvider interface
-type binanceAdapter struct {
-	provider      *pricing.BinanceProvider
-	symbol        string
-	baseSymbol    string
-	quoteSymbol   string
-	baseDecimals  int
-	quoteDecimals int
-	quoteIsStable bool
-}
-
-func (b *binanceAdapter) GetPrice(ctx context.Context, size *big.Int, isBuy bool, gasPrice *big.Int, blockNum uint64) (*pricing.Price, error) {
-	// CEX doesn't use gas price or block number, ignore them
-	price, err := b.provider.GetPrice(ctx, b.symbol, size, isBuy, b.baseDecimals, b.quoteDecimals)
-	if err != nil {
-		return nil, err
-	}
-
-	// Attach metadata for downstream calculations
-	price.BaseSymbol = b.baseSymbol
-	price.QuoteSymbol = b.quoteSymbol
-	price.BaseDecimals = b.baseDecimals
-	price.QuoteDecimals = b.quoteDecimals
-	price.QuoteIsStable = b.quoteIsStable
-
-	return price, nil
-}
-
-// GetETHPrice implements arbitrage.ETHPriceProvider interface
-func (b *binanceAdapter) GetETHPrice(ctx context.Context) (float64, error) {
-	return b.provider.GetETHPrice(ctx)
-}
-
-// uniswapAdapter adapts UniswapProvider to arbitrage.PriceProvider interface
-type uniswapAdapter struct {
-	provider      *pricing.UniswapProvider
-	baseSymbol    string
-	quoteSymbol   string
-	baseDecimals  int
-	quoteDecimals int
-	quoteIsStable bool
-}
-
-func (u *uniswapAdapter) GetPrice(ctx context.Context, size *big.Int, isBuy bool, gasPrice *big.Int, blockNum uint64) (*pricing.Price, error) {
-	// Pass gas price and block number to DEX provider (for caching and gas estimation)
-	price, err := u.provider.GetPrice(ctx, size, isBuy, gasPrice, blockNum)
-	if err != nil {
-		return nil, err
-	}
-
-	// Attach metadata for downstream calculations
-	price.BaseSymbol = u.baseSymbol
-	price.QuoteSymbol = u.quoteSymbol
-	price.BaseDecimals = u.baseDecimals
-	price.QuoteDecimals = u.quoteDecimals
-	price.QuoteIsStable = u.quoteIsStable
-
-	return price, nil
-}
 
 // createDetectorForPair creates a detector instance for a specific trading pair
 func createDetectorForPair(
@@ -89,10 +29,11 @@ func createDetectorForPair(
 	pairCfg config.TradingPairConfig,
 	binanceProvider *pricing.BinanceProvider,
 	clientPool *blockchain.ClientPool,
-	publisher *notification.Publisher,
+	publisher arbitrage.NotificationPublisher,
 	layeredCache *cache.LayeredCache,
 	logger *observability.Logger,
 	metrics *observability.Metrics,
+	tracer observability.Tracer,
 	globalCfg *config.Config,
 	dexQuoteLimiter *semaphore.Weighted,
 ) (*arbitrage.Detector, *pricing.UniswapProvider, error) {
@@ -115,6 +56,7 @@ func createDetectorForPair(
 		Cache:          layeredCache,
 		Logger:         logger,
 		Metrics:        metrics,
+		Tracer:         tracer,
 		FeeTiers:       globalCfg.Uniswap.FeeTiers,
 		RateLimitRPM:   globalCfg.Uniswap.RateLimit.RequestsPerMinute,
 		RateLimitBurst: globalCfg.Uniswap.RateLimit.Burst,
@@ -135,31 +77,30 @@ func createDetectorForPair(
 
 	// Create detector with adapters
 	detector, err := arbitrage.NewDetector(arbitrage.DetectorConfig{
-		CEXProvider: &binanceAdapter{
-			provider:      binanceProvider,
-			symbol:        cexSymbol,
-			baseSymbol:    pairCfg.Base.Symbol,
-			quoteSymbol:   pairCfg.Quote.Symbol,
-			baseDecimals:  pairCfg.Base.Decimals,
-			quoteDecimals: pairCfg.Quote.Decimals,
-			quoteIsStable: pairCfg.Quote.IsStablecoin,
+		CEXProvider: &pricing.BinanceAdapter{
+			Provider:      binanceProvider,
+			Symbol:        cexSymbol,
+			BaseSymbol:    pairCfg.Base.Symbol,
+			QuoteSymbol:   pairCfg.Quote.Symbol,
+			BaseDecimals:  pairCfg.Base.Decimals,
+			QuoteDecimals: pairCfg.Quote.Decimals,
+			QuoteIsStable: pairCfg.Quote.IsStablecoin,
 		},
-		DEXProvider: &uniswapAdapter{
-			provider:      uniswapProvider,
-			baseSymbol:    pairCfg.Base.Symbol,
-			quoteSymbol:   pairCfg.Quote.Symbol,
-			baseDecimals:  pairCfg.Base.Decimals,
-			quoteDecimals: pairCfg.Quote.Decimals,
-			quoteIsStable: pairCfg.Quote.IsStablecoin,
+		DEXProvider: &pricing.UniswapAdapter{
+			Provider:      uniswapProvider,
+			BaseSymbol:    pairCfg.Base.Symbol,
+			QuoteSymbol:   pairCfg.Quote.Symbol,
+			BaseDecimals:  pairCfg.Base.Decimals,
+			QuoteDecimals: pairCfg.Quote.Decimals,
+			QuoteIsStable: pairCfg.Quote.IsStablecoin,
 		},
 		Publisher:       publisher,
-		Cache:           layeredCache,
 		Logger:          logger,
 		Metrics:         metrics,
+		Tracer:          tracer,
 		TradeSizes:      pairCfg.GetParsedTradeSizes(),
 		MinProfitPct:    pairCfg.MinProfitThreshold,
 		ETHPriceUSD:     2000, // Will be updated from Binance
-		TradingSymbol:   cexSymbol,
 		EthClient:       ethClient,
 		DEXQuoteLimiter: dexQuoteLimiter,
 		// Multi-pair support
@@ -188,16 +129,25 @@ func main() {
 
 	metrics, err := observability.NewMetrics("arbitrage-detector", cfg.Observability.Metrics.Enabled)
 	if err != nil {
-		log.Fatalf("Failed to create metrics: %v", err)
+		logger.LogError(ctx, "failed to create metrics", err)
+		os.Exit(1)
 	}
 
 	tracer, err := observability.NewTracerProvider(ctx, "arbitrage-detector", cfg.Observability.Tracing.Endpoint, cfg.Observability.Tracing.Enabled)
 	if err != nil {
-		log.Fatalf("Failed to create tracer: %v", err)
+		logger.LogError(ctx, "failed to create tracer", err)
+		os.Exit(1)
 	}
 	defer tracer.Shutdown(ctx)
 
 	logger.Info("observability setup complete")
+
+	var appTracer observability.Tracer
+	if cfg.Observability.Tracing.Enabled {
+		appTracer = observability.NewTracer("arbitrage-detector")
+	} else {
+		appTracer = observability.NewNoopTracer()
+	}
 
 	// Setup infrastructure
 	logger.Info("setting up infrastructure...")
@@ -206,7 +156,7 @@ func main() {
 	redisCache, err := cache.NewRedisCache(cfg.Redis.Address, cfg.Redis.Password, cfg.Redis.DB)
 	if err != nil {
 		logger.LogError(ctx, "failed to create Redis cache", err)
-		log.Fatalf("Failed to create Redis cache: %v", err)
+		os.Exit(1)
 	}
 	defer redisCache.Close()
 
@@ -217,22 +167,26 @@ func main() {
 	// Layered cache
 	layeredCache := cache.NewLayeredCache(memCache, redisCache)
 
-	// AWS configuration
-	awsCfg, err := aws.LoadAWSConfig(ctx, aws.Config{
-		Region:   cfg.AWS.Region,
-		Endpoint: cfg.AWS.Endpoint,
-	})
-	if err != nil {
-		logger.LogError(ctx, "failed to load AWS config", err)
-		log.Fatalf("Failed to load AWS config: %v", err)
-	}
+	// AWS configuration (optional - only needed if SNS is configured)
+	var snsClient *aws.SNSClient
+	if cfg.AWS.SNSTopicARN != "" {
+		awsCfg, err := aws.LoadAWSConfig(ctx, aws.Config{
+			Region: cfg.AWS.Region,
+		})
+		if err != nil {
+			logger.LogError(ctx, "failed to load AWS config", err)
+			os.Exit(1)
+		}
 
-	// SNS client
-	snsClient := aws.NewSNSClient(aws.SNSClientConfig{
-		AWSConfig: awsCfg,
-		Logger:    logger,
-		Metrics:   metrics,
-	})
+		snsClient = aws.NewSNSClient(aws.SNSClientConfig{
+			AWSConfig: awsCfg,
+			Logger:    logger,
+			Metrics:   metrics,
+		})
+		logger.Info("AWS SNS configured", "topic_arn", cfg.AWS.SNSTopicARN)
+	} else {
+		logger.Info("AWS SNS not configured, opportunities will only be logged")
+	}
 
 	// Create Ethereum client pool
 	logger.Info("connecting to Ethereum...")
@@ -251,7 +205,7 @@ func main() {
 	})
 	if err != nil {
 		logger.LogError(ctx, "failed to create client pool", err)
-		log.Fatalf("Failed to create client pool: %v", err)
+		os.Exit(1)
 	}
 	defer clientPool.Close()
 
@@ -272,24 +226,34 @@ func main() {
 		Cache:          layeredCache,
 		Logger:         logger,
 		Metrics:        metrics,
+		Tracer:         appTracer,
 		TradingFee:     0.001, // 0.1% Binance fee
 	})
 	if err != nil {
 		logger.LogError(ctx, "failed to create Binance provider", err)
-		log.Fatalf("Failed to create Binance provider: %v", err)
+		os.Exit(1)
 	}
 
-	// Create notification publisher
+	// Create notification publisher (SNS or NoOp based on configuration)
 	logger.Info("creating notification publisher...")
-	publisher, err := notification.NewPublisher(notification.PublisherConfig{
-		SNSClient: snsClient,
-		TopicARN:  cfg.AWS.SNSTopicARN,
-		Logger:    logger,
-		Metrics:   metrics,
-	})
-	if err != nil {
-		logger.LogError(ctx, "failed to create publisher", err)
-		log.Fatalf("Failed to create publisher: %v", err)
+	var publisher arbitrage.NotificationPublisher
+	if snsClient != nil && cfg.AWS.SNSTopicARN != "" {
+		snsPublisher, err := notification.NewPublisher(notification.PublisherConfig{
+			SNSClient: snsClient,
+			TopicARN:  cfg.AWS.SNSTopicARN,
+			Logger:    logger,
+			Metrics:   metrics,
+			Tracer:    appTracer,
+		})
+		if err != nil {
+			logger.LogError(ctx, "failed to create SNS publisher", err)
+			os.Exit(1)
+		}
+		publisher = snsPublisher
+		logger.Info("using SNS publisher", "topic_arn", cfg.AWS.SNSTopicARN)
+	} else {
+		publisher = notification.NewNoOpPublisher(logger)
+		logger.Info("using no-op publisher (SNS disabled)")
 	}
 
 	// Create arbitrage detectors (one per trading pair)
@@ -307,12 +271,13 @@ func main() {
 			layeredCache,
 			logger,
 			metrics,
+			appTracer,
 			cfg,
 			dexQuoteLimiter,
 		)
 		if err != nil {
 			logger.LogError(ctx, "failed to create detector for pair", err, "pair", pairCfg.Name)
-			log.Fatalf("Failed to create detector for pair %s: %v", pairCfg.Name, err)
+			os.Exit(1)
 		}
 		detectors[pairCfg.Name] = detector
 		dexProviders[pairCfg.Name] = dexProvider
@@ -339,12 +304,13 @@ func main() {
 		WebSocketURLs:   cfg.Ethereum.WebSocketURLs,
 		Logger:          logger,
 		Metrics:         metrics,
+		Tracer:          appTracer,
 		ReconnectConfig: blockchain.DefaultReconnectConfig(),
 		ClientPool:      clientPool, // NEW: for HTTP RPC fallback
 	})
 	if err != nil {
 		logger.LogError(ctx, "failed to create subscriber", err)
-		log.Fatalf("Failed to create subscriber: %v", err)
+		os.Exit(1)
 	}
 
 	// Start HTTP server for health checks and metrics
@@ -358,7 +324,7 @@ func main() {
 	// Run application
 	logger.Info("starting arbitrage detector application...")
 	go func() {
-		if err := runDetector(ctx, detectors, subscriber, logger, metrics); err != nil {
+		if err := runDetector(ctx, detectors, subscriber, logger, metrics, appTracer); err != nil {
 			logger.LogError(ctx, "detector error", err)
 			cancel()
 		}
@@ -396,7 +362,12 @@ func runDetector(
 	subscriber *blockchain.Subscriber,
 	logger *observability.Logger,
 	metrics *observability.Metrics,
+	tracer observability.Tracer,
 ) error {
+	if tracer == nil {
+		tracer = observability.NewNoopTracer()
+	}
+
 	// Subscribe to new blocks
 	blockCh, errCh, err := subscriber.Subscribe(ctx)
 	if err != nil {
@@ -408,11 +379,34 @@ func runDetector(
 	// Process blocks
 	for {
 		select {
-		case block := <-blockCh:
+		case block, ok := <-blockCh:
+			if !ok {
+				blockCh = nil
+				if errCh == nil {
+					logger.Info("all subscription channels closed, stopping detector loop")
+					return nil
+				}
+				continue
+			}
+			if block == nil || block.Number == nil {
+				logger.Warn("received invalid nil block from subscriber")
+				continue
+			}
 			start := time.Now()
+			blockNumber := block.Number.Uint64()
+
+			blockCtx, blockSpan := tracer.StartSpan(
+				ctx,
+				fmt.Sprintf("Block #%d", blockNumber),
+				observability.WithAttributes(
+					attribute.Int64("block_number", int64(blockNumber)),
+					attribute.String("block_hash", block.Hash.Hex()),
+					attribute.Int("pairs", len(detectors)),
+				),
+			)
 
 			logger.Info("processing block",
-				"block_number", block.Number.Uint64(),
+				"block_number", blockNumber,
 				"block_hash", block.Hash.Hex(),
 				"timestamp", block.Timestamp,
 			)
@@ -429,7 +423,7 @@ func runDetector(
 			// Launch detectors for each pair concurrently
 			for pairName, detector := range detectors {
 				go func(name string, det *arbitrage.Detector) {
-					opps, err := det.Detect(ctx, block.Number.Uint64(), block.Timestamp)
+					opps, err := det.Detect(blockCtx, blockNumber, block.Timestamp)
 					resultsCh <- pairResult{
 						pair:          name,
 						opportunities: opps,
@@ -443,8 +437,9 @@ func runDetector(
 			for i := 0; i < len(detectors); i++ {
 				result := <-resultsCh
 				if result.err != nil {
-					logger.LogError(ctx, "detection failed for pair", result.err,
-						"block", block.Number.Uint64(),
+					blockSpan.NoticeError(result.err)
+					logger.LogError(blockCtx, "detection failed for pair", result.err,
+						"block", blockNumber,
 						"pair", result.pair,
 					)
 					continue
@@ -464,13 +459,27 @@ func runDetector(
 			// Record block processing time
 			duration := time.Since(start)
 			logger.Info("block processed",
-				"block", block.Number.Uint64(),
+				"block", blockNumber,
 				"opportunities", totalOpportunities,
 				"pairs", len(detectors),
 				"duration_ms", duration.Milliseconds(),
 			)
+			blockSpan.SetAttribute("opportunities", totalOpportunities)
+			blockSpan.SetAttribute("duration_ms", duration.Milliseconds())
+			blockSpan.End()
 
-		case err := <-errCh:
+		case err, ok := <-errCh:
+			if !ok {
+				errCh = nil
+				if blockCh == nil {
+					logger.Info("all subscription channels closed, stopping detector loop")
+					return nil
+				}
+				continue
+			}
+			if err == nil {
+				continue
+			}
 			logger.LogError(ctx, "block subscription error", err)
 			// Subscriber will auto-reconnect
 

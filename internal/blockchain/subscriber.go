@@ -4,21 +4,23 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"math/rand"
 	"sync"
 	"time"
 
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/observability"
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/resilience"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/observability"
-	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/resilience"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Block represents an Ethereum block header
 type Block struct {
-	Number    *big.Int
-	Hash      common.Hash
-	Timestamp uint64
+	Number     *big.Int
+	Hash       common.Hash
+	Timestamp  uint64
 	ParentHash common.Hash
 }
 
@@ -29,24 +31,30 @@ func (b *Block) IsValid() bool {
 
 // Subscriber manages Ethereum block subscriptions with automatic reconnection
 type Subscriber struct {
-	wsURLs             []string
-	currentURLIdx      int
-	client             *ethclient.Client
-	subscription       interface{}
-	logger             *observability.Logger
-	metrics            *observability.Metrics
-	lastBlockNumber    uint64
-	reconnectConfig    ReconnectConfig
-	mu                 sync.RWMutex
-	isConnected        bool
-	heartbeatInterval  time.Duration
-	heartbeatTimeout   time.Duration
-	messageTimeout     time.Duration
-	reconnectAttempts  int
-	clientPool         *ClientPool   // NEW: for HTTP RPC fallback
-	pollInterval       time.Duration // NEW: how often to poll when WS down (default 12s = 1 block)
-	maxWSFailures      int           // NEW: switch to HTTP after N consecutive WS failures (default 3)
-	wsFailureCount     int           // NEW: track consecutive failures
+	wsURLs            []string
+	currentURLIdx     int
+	client            *ethclient.Client
+	subscription      interface{}
+	logger            *observability.Logger
+	metrics           *observability.Metrics
+	tracer            observability.Tracer
+	lastBlockNumber   uint64
+	reconnectConfig   ReconnectConfig
+	mu                sync.RWMutex
+	isConnected       bool
+	heartbeatInterval time.Duration
+	heartbeatTimeout  time.Duration
+	messageTimeout    time.Duration
+	reconnectAttempts int
+	clientPool        *ClientPool   // NEW: for HTTP RPC fallback
+	pollInterval      time.Duration // NEW: how often to poll when WS down (default 12s = 1 block)
+	maxWSFailures     int           // NEW: switch to HTTP after N consecutive WS failures (default 3)
+	wsFailureCount    int           // NEW: track consecutive failures
+
+	// Connection health tracking
+	lastMessageTime time.Time  // Last time we received any message
+	lastHealthCheck time.Time  // Last time we performed a health check
+	healthCheckMu   sync.Mutex // Protects health check timing
 }
 
 // SubscriberConfig holds subscriber configuration
@@ -54,6 +62,7 @@ type SubscriberConfig struct {
 	WebSocketURLs     []string
 	Logger            *observability.Logger
 	Metrics           *observability.Metrics
+	Tracer            observability.Tracer
 	ReconnectConfig   ReconnectConfig
 	HeartbeatInterval time.Duration
 	HeartbeatTimeout  time.Duration
@@ -106,12 +115,16 @@ func NewSubscriber(cfg SubscriberConfig) (*Subscriber, error) {
 	if cfg.MaxWSFailures == 0 {
 		cfg.MaxWSFailures = 3 // Default: switch after 3 failures
 	}
+	if cfg.Tracer == nil {
+		cfg.Tracer = observability.NewNoopTracer()
+	}
 
 	return &Subscriber{
 		wsURLs:            cfg.WebSocketURLs,
 		currentURLIdx:     0,
 		logger:            cfg.Logger,
 		metrics:           cfg.Metrics,
+		tracer:            cfg.Tracer,
 		reconnectConfig:   cfg.ReconnectConfig,
 		heartbeatInterval: cfg.HeartbeatInterval,
 		heartbeatTimeout:  cfg.HeartbeatTimeout,
@@ -127,15 +140,107 @@ func (s *Subscriber) Subscribe(ctx context.Context) (<-chan *Block, <-chan error
 	blockCh := make(chan *Block, 10)
 	errCh := make(chan error, 10)
 
-	// Initial connection
+	wsMode := true
+
+	// Initial connection (graceful fallback to HTTP polling if available)
 	if err := s.connect(ctx); err != nil {
-		return nil, nil, fmt.Errorf("initial connection failed: %w", err)
+		if s.clientPool == nil {
+			return nil, nil, fmt.Errorf("initial connection failed: %w", err)
+		}
+		wsMode = false
+		s.logger.Warn("initial WebSocket connection failed, starting in HTTP polling mode",
+			"error", err,
+			"poll_interval_seconds", s.pollInterval.Seconds(),
+		)
 	}
 
+	// Initialize health tracking
+	s.healthCheckMu.Lock()
+	s.lastMessageTime = time.Now()
+	s.lastHealthCheck = time.Now()
+	s.healthCheckMu.Unlock()
+
 	// Start subscription loop
-	go s.subscriptionLoop(ctx, blockCh, errCh)
+	go s.subscriptionLoop(ctx, blockCh, errCh, wsMode)
+
+	// Start heartbeat/health check goroutine
+	go s.runHeartbeat(ctx)
 
 	return blockCh, errCh, nil
+}
+
+// runHeartbeat periodically checks connection health
+// Since ethclient doesn't expose ping/pong, we use eth_blockNumber as a health check
+func (s *Subscriber) runHeartbeat(ctx context.Context) {
+	ticker := time.NewTicker(s.heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.performHealthCheck(ctx)
+		}
+	}
+}
+
+// performHealthCheck checks if the connection is still alive
+func (s *Subscriber) performHealthCheck(ctx context.Context) {
+	s.mu.RLock()
+	client := s.client
+	isConnected := s.isConnected
+	s.mu.RUnlock()
+
+	if !isConnected || client == nil {
+		return // Not connected, skip health check
+	}
+
+	// Create a timeout context for the health check
+	checkCtx, cancel := context.WithTimeout(ctx, s.heartbeatTimeout)
+	defer cancel()
+
+	// Use eth_blockNumber as a lightweight health check (simulates ping)
+	start := time.Now()
+	blockNum, err := client.BlockNumber(checkCtx)
+	duration := time.Since(start)
+
+	s.healthCheckMu.Lock()
+	s.lastHealthCheck = time.Now()
+	s.healthCheckMu.Unlock()
+
+	if err != nil {
+		s.logger.Warn("heartbeat health check failed",
+			"error", err,
+			"duration_ms", duration.Milliseconds(),
+		)
+		// Check if we should consider connection stale
+		s.healthCheckMu.Lock()
+		timeSinceLastMessage := time.Since(s.lastMessageTime)
+		s.healthCheckMu.Unlock()
+
+		if timeSinceLastMessage > s.messageTimeout {
+			s.logger.Warn("connection appears stale, forcing reconnect",
+				"last_message_ago", timeSinceLastMessage.Seconds(),
+			)
+			// Mark as disconnected to trigger reconnect
+			s.mu.Lock()
+			s.isConnected = false
+			s.mu.Unlock()
+		}
+		return
+	}
+
+	// Health check succeeded - connection is alive
+	s.logger.Debug("heartbeat health check passed",
+		"block_number", blockNum,
+		"latency_ms", duration.Milliseconds(),
+	)
+
+	// Record health check metric
+	if s.metrics != nil {
+		s.metrics.RecordWebSocketHealthCheck(ctx, duration, true)
+	}
 }
 
 // connect establishes WebSocket connection to Ethereum node
@@ -181,11 +286,9 @@ func (s *Subscriber) connect(ctx context.Context) error {
 }
 
 // subscriptionLoop manages the subscription lifecycle with automatic reconnection and HTTP fallback
-func (s *Subscriber) subscriptionLoop(ctx context.Context, blockCh chan<- *Block, errCh chan<- error) {
+func (s *Subscriber) subscriptionLoop(ctx context.Context, blockCh chan<- *Block, errCh chan<- error, wsMode bool) {
 	defer close(blockCh)
 	defer close(errCh)
-
-	wsMode := true // Start in WebSocket mode
 
 	for {
 		select {
@@ -203,15 +306,27 @@ func (s *Subscriber) subscriptionLoop(ctx context.Context, blockCh chan<- *Block
 					select {
 					case errCh <- err:
 					default:
+						// Error channel is full, log and record metric
+						s.logger.Warn("error channel full, dropping error",
+							"error", err,
+							"source", "websocket_subscription",
+						)
+						if s.metrics != nil {
+							s.metrics.RecordDroppedError(ctx, "websocket_subscription", "subscription_error")
+						}
 					}
 
-					// Increment failure count
+					// Increment failure count (protected by mutex)
+					s.mu.Lock()
 					s.wsFailureCount++
+					wsFailures := s.wsFailureCount
+					shouldSwitchToHTTP := s.clientPool != nil && wsFailures >= s.maxWSFailures
+					s.mu.Unlock()
 
 					// Check if we should switch to HTTP polling
-					if s.clientPool != nil && s.wsFailureCount >= s.maxWSFailures {
+					if shouldSwitchToHTTP {
 						s.logger.Warn("switching to HTTP polling fallback",
-							"ws_failures", s.wsFailureCount,
+							"ws_failures", wsFailures,
 						)
 						wsMode = false
 						continue
@@ -254,8 +369,10 @@ func (s *Subscriber) subscriptionLoop(ctx context.Context, blockCh chan<- *Block
 						"attempts", s.reconnectAttempts,
 					)
 
-					// Reset failure count on successful connection
+					// Reset failure count on successful connection (protected by mutex)
+					s.mu.Lock()
 					s.wsFailureCount = 0
+					s.mu.Unlock()
 				}
 			} else {
 				// HTTP polling mode
@@ -270,6 +387,14 @@ func (s *Subscriber) subscriptionLoop(ctx context.Context, blockCh chan<- *Block
 					select {
 					case errCh <- err:
 					default:
+						// Error channel is full, log and record metric
+						s.logger.Warn("error channel full, dropping error",
+							"error", err,
+							"source", "http_polling",
+						)
+						if s.metrics != nil {
+							s.metrics.RecordDroppedError(ctx, "http_polling", "polling_error")
+						}
 					}
 
 					// Wait before retrying
@@ -280,16 +405,21 @@ func (s *Subscriber) subscriptionLoop(ctx context.Context, blockCh chan<- *Block
 					}
 				}
 
-				// Periodically try to switch back to WebSocket
+				// Periodically try to switch back to WebSocket (protected by mutex)
+				s.mu.Lock()
 				if s.wsFailureCount > 0 {
 					s.wsFailureCount-- // Decay failure count
 				}
+				shouldTryWebSocket := s.wsFailureCount == 0
+				s.mu.Unlock()
 
-				if s.wsFailureCount == 0 {
+				if shouldTryWebSocket {
 					s.logger.Info("attempting to switch back to WebSocket mode")
 					if err := s.connect(ctx); err != nil {
 						s.logger.Warn("failed to reconnect to WebSocket, staying in HTTP mode", "error", err)
+						s.mu.Lock()
 						s.wsFailureCount = 1 // Prevent immediate retry
+						s.mu.Unlock()
 					} else {
 						wsMode = true
 						s.logger.Info("successfully switched back to WebSocket mode")
@@ -338,6 +468,11 @@ func (s *Subscriber) subscribeToBlocks(ctx context.Context, blockCh chan<- *Bloc
 
 		case header := <-headers:
 			lastMessageTime = time.Now()
+
+			// Update health tracking
+			s.healthCheckMu.Lock()
+			s.lastMessageTime = lastMessageTime
+			s.healthCheckMu.Unlock()
 
 			// Convert to our Block type
 			block := &Block{
@@ -408,10 +543,8 @@ func (s *Subscriber) subscribeToBlocks(ctx context.Context, blockCh chan<- *Bloc
 			}
 
 			// Send block to channel
-			select {
-			case blockCh <- block:
-			case <-ctx.Done():
-				return ctx.Err()
+			if err := s.processBlock(ctx, block, "ws", blockCh); err != nil {
+				return err
 			}
 
 		case <-time.After(s.messageTimeout):
@@ -448,11 +581,13 @@ func (s *Subscriber) calculateReconnectDelay() time.Duration {
 		delay = s.reconnectConfig.MaxDelay
 	}
 
-	// Add jitter
+	// Add jitter using proper randomness
+	// Jitter range: [delay * (1 - jitter), delay * (1 + jitter)]
 	if retryConfig.Jitter > 0 {
-		jitterAmount := float64(delay) * retryConfig.Jitter
-		jitterRange := jitterAmount * 2
-		delay = time.Duration(float64(delay) - jitterAmount + (float64(time.Now().UnixNano()%1000000) / 1000000.0 * jitterRange))
+		jitterFraction := retryConfig.Jitter
+		// Generate random value in range [-jitterFraction, +jitterFraction]
+		jitterMultiplier := 1.0 + (rand.Float64()*2-1)*jitterFraction
+		delay = time.Duration(float64(delay) * jitterMultiplier)
 	}
 
 	return delay
@@ -545,10 +680,8 @@ func (s *Subscriber) backfillBlocks(ctx context.Context, startBlock, endBlock ui
 		s.logger.Info("backfilled block", "block", blockNum)
 
 		// Send backfilled block to processing pipeline
-		select {
-		case blockCh <- block:
-		case <-ctx.Done():
-			return ctx.Err()
+		if err := s.processBlock(ctx, block, "http", blockCh); err != nil {
+			return err
 		}
 	}
 
@@ -659,13 +792,43 @@ func (s *Subscriber) pollBlocks(ctx context.Context, blockCh chan<- *Block, errC
 				}
 
 				// Send block to channel
-				select {
-				case blockCh <- block:
-				case <-ctx.Done():
-					return ctx.Err()
+				if err := s.processBlock(ctx, block, "http", blockCh); err != nil {
+					return err
 				}
 			}
 		}
+	}
+}
+
+func (s *Subscriber) processBlock(ctx context.Context, block *Block, source string, blockCh chan<- *Block) error {
+	if block == nil || block.Number == nil {
+		return fmt.Errorf("invalid block")
+	}
+
+	blockNum := block.Number.Uint64()
+	spanCtx, span := s.tracer.StartSpan(
+		ctx,
+		"Subscriber.processBlock",
+		observability.WithAttributes(
+			attribute.Int64("block_number", int64(blockNum)),
+			attribute.String("block_hash", block.Hash.Hex()),
+			attribute.String("source", source),
+		),
+	)
+	defer span.End()
+
+	if !block.IsValid() {
+		err := fmt.Errorf("invalid block: %d", blockNum)
+		span.NoticeError(err)
+		return err
+	}
+
+	select {
+	case blockCh <- block:
+		return nil
+	case <-spanCtx.Done():
+		span.NoticeError(spanCtx.Err())
+		return spanCtx.Err()
 	}
 }
 

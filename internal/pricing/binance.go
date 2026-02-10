@@ -14,6 +14,7 @@ import (
 	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/cache"
 	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/observability"
 	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/platform/resilience"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Price represents a price quote for a trade
@@ -41,6 +42,7 @@ type BinanceProvider struct {
 	cache       cache.Cache
 	logger      *observability.Logger
 	metrics     *observability.Metrics
+	tracer      observability.Tracer
 	tradingFee  float64 // Binance trading fee (0.1% = 0.001)
 	retryCfg    resilience.RetryConfig
 	cb          *resilience.CircuitBreaker
@@ -57,6 +59,7 @@ type BinanceProviderConfig struct {
 	Cache          cache.Cache
 	Logger         *observability.Logger
 	Metrics        *observability.Metrics
+	Tracer         observability.Tracer
 	TradingFee     float64
 	RetryConfig    resilience.RetryConfig
 	CircuitBreaker *resilience.CircuitBreaker
@@ -83,6 +86,9 @@ func NewBinanceProvider(cfg BinanceProviderConfig) (*BinanceProvider, error) {
 	}
 	if cfg.TradingFee == 0 {
 		cfg.TradingFee = 0.001 // 0.1% default
+	}
+	if cfg.Tracer == nil {
+		cfg.Tracer = observability.NewNoopTracer()
 	}
 	if cfg.RetryConfig.MaxAttempts == 0 {
 		cfg.RetryConfig = resilience.RetryConfig{
@@ -127,6 +133,7 @@ func NewBinanceProvider(cfg BinanceProviderConfig) (*BinanceProvider, error) {
 		cache:       cfg.Cache,
 		logger:      cfg.Logger,
 		metrics:     cfg.Metrics,
+		tracer:      cfg.Tracer,
 		tradingFee:  cfg.TradingFee,
 		retryCfg:    cfg.RetryConfig,
 		cb:          cb,
@@ -136,8 +143,30 @@ func NewBinanceProvider(cfg BinanceProviderConfig) (*BinanceProvider, error) {
 	}, nil
 }
 
-// GetPrice fetches current price for a trading pair and trade size
+// GetPrice fetches current price for a trading pair and trade size.
+// This is kept for backward compatibility and uses non-block-scoped caching.
 func (b *BinanceProvider) GetPrice(ctx context.Context, symbol string, size *big.Int, isBuy bool, baseDecimals, quoteDecimals int) (*Price, error) {
+	return b.getPrice(ctx, symbol, size, isBuy, baseDecimals, quoteDecimals, 0)
+}
+
+// GetPriceForBlock fetches current price scoped to a specific block number.
+// This guarantees one orderbook snapshot per block (shared by all trade sizes/sides in that block).
+func (b *BinanceProvider) GetPriceForBlock(ctx context.Context, symbol string, size *big.Int, isBuy bool, baseDecimals, quoteDecimals int, blockNum uint64) (*Price, error) {
+	return b.getPrice(ctx, symbol, size, isBuy, baseDecimals, quoteDecimals, blockNum)
+}
+
+func (b *BinanceProvider) getPrice(ctx context.Context, symbol string, size *big.Int, isBuy bool, baseDecimals, quoteDecimals int, blockNum uint64) (*Price, error) {
+	ctx, span := b.tracer.StartSpan(
+		ctx,
+		"Binance.GetPrice",
+		observability.WithAttributes(
+			attribute.String("symbol", symbol),
+			attribute.String("side", map[bool]string{true: "buy", false: "sell"}[isBuy]),
+			attribute.String("size", size.String()),
+		),
+	)
+	defer span.End()
+
 	start := time.Now()
 
 	if baseDecimals == 0 {
@@ -152,6 +181,9 @@ func (b *BinanceProvider) GetPrice(ctx context.Context, symbol string, size *big
 
 	// Try cache first
 	cacheKey := fmt.Sprintf("binance:orderbook:%s", symbol)
+	if blockNum > 0 {
+		cacheKey = fmt.Sprintf("binance:orderbook:%s:%d", symbol, blockNum)
+	}
 	var orderbook *Orderbook
 
 	if b.cache != nil {
@@ -176,6 +208,7 @@ func (b *BinanceProvider) GetPrice(ctx context.Context, symbol string, size *big
 		var err error
 		orderbook, err = b.GetOrderbook(ctx, symbol, 100)
 		if err != nil {
+			span.NoticeError(err)
 			return nil, fmt.Errorf("failed to fetch orderbook: %w", err)
 		}
 
@@ -188,6 +221,7 @@ func (b *BinanceProvider) GetPrice(ctx context.Context, symbol string, size *big
 	// Calculate execution result with actual USDC flows
 	execResult, err := orderbook.CalculateExecution(baseSize, isBuy)
 	if err != nil {
+		span.NoticeError(err)
 		return nil, fmt.Errorf("failed to calculate execution: %w", err)
 	}
 
@@ -211,6 +245,8 @@ func (b *BinanceProvider) GetPrice(ctx context.Context, symbol string, size *big
 	if b.metrics != nil {
 		b.metrics.RecordCEXAPICall(ctx, "binance", "orderbook", "success", duration)
 	}
+	slippageFloat, _ := execResult.Slippage.Float64()
+	span.SetAttribute("slippage", slippageFloat)
 
 	b.logger.Info("fetched Binance price",
 		"symbol", symbol,
@@ -288,7 +324,18 @@ func (b *BinanceProvider) GetETHPrice(ctx context.Context) (float64, error) {
 
 // GetOrderbook fetches orderbook snapshot from Binance
 func (b *BinanceProvider) GetOrderbook(ctx context.Context, symbol string, depth int) (*Orderbook, error) {
-	return resilience.ExecuteWithResult(b.cb, ctx, func(ctx context.Context) (*Orderbook, error) {
+	ctx, span := b.tracer.StartSpan(
+		ctx,
+		"Binance.GetOrderbook",
+		observability.WithAttributes(
+			attribute.String("symbol", symbol),
+			attribute.Bool("cache_hit", false),
+		),
+	)
+	defer span.End()
+
+	start := time.Now()
+	orderbook, err := resilience.ExecuteWithResult(b.cb, ctx, func(ctx context.Context) (*Orderbook, error) {
 		return resilience.RetryIfWithResult(ctx, b.retryCfg, resilience.IsRetryable, func(ctx context.Context) (*Orderbook, error) {
 			// Wait for rate limiter
 			if err := b.rateLimiter.Wait(ctx); err != nil {
@@ -315,6 +362,12 @@ func (b *BinanceProvider) GetOrderbook(ctx context.Context, symbol string, depth
 			return orderbook, err
 		})
 	})
+	duration := time.Since(start)
+	span.SetAttribute("latency_ms", duration.Milliseconds())
+	if err != nil {
+		span.NoticeError(err)
+	}
+	return orderbook, err
 }
 
 func (b *BinanceProvider) fetchOrderbook(ctx context.Context, url string) (*Orderbook, error) {

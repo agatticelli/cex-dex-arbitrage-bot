@@ -3,7 +3,24 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
+)
+
+// ErrBackpressure is returned when the job queue is full and drop policy is DropNewest
+var ErrBackpressure = errors.New("job queue full: backpressure applied")
+
+// DropPolicy defines how to handle new jobs when the queue is full
+type DropPolicy int
+
+const (
+	// DropPolicyBlock blocks until space is available (default behavior)
+	DropPolicyBlock DropPolicy = iota
+	// DropPolicyNewest rejects new jobs when queue is full
+	DropPolicyNewest
+	// DropPolicyOldest drops the oldest job to make room for new ones
+	DropPolicyOldest
 )
 
 // Job represents a unit of work to be executed by a worker.
@@ -24,15 +41,36 @@ type Result struct {
 	Err error
 }
 
+// PoolStats holds statistics about the pool
+type PoolStats struct {
+	JobsSubmitted uint64
+	JobsCompleted uint64
+	JobsDropped   uint64
+	QueueLength   int
+}
+
 // Pool is a worker pool that processes jobs concurrently.
 // It maintains a fixed number of worker goroutines that pull jobs from a queue.
 type Pool struct {
-	workers  int
-	jobQueue chan Job
-	results  chan Result
-	wg       sync.WaitGroup
-	ctx      context.Context
-	cancel   context.CancelFunc
+	workers    int
+	jobQueue   chan Job
+	results    chan Result
+	wg         sync.WaitGroup
+	ctx        context.Context
+	cancel     context.CancelFunc
+	dropPolicy DropPolicy
+
+	// Statistics (atomic for thread-safety)
+	jobsSubmitted uint64
+	jobsCompleted uint64
+	jobsDropped   uint64
+}
+
+// PoolConfig holds configuration for creating a new pool
+type PoolConfig struct {
+	Workers    int
+	QueueSize  int
+	DropPolicy DropPolicy
 }
 
 // NewPool creates a new worker pool with the specified number of workers.
@@ -49,25 +87,35 @@ type Pool struct {
 //	defer pool.Close()
 //	pool.Submit(worker.Job{ID: "job1", Execute: func(ctx) (interface{}, error) { ... }})
 func NewPool(ctx context.Context, workers int, queueSize int) *Pool {
-	if workers <= 0 {
-		workers = 1
+	return NewPoolWithConfig(ctx, PoolConfig{
+		Workers:    workers,
+		QueueSize:  queueSize,
+		DropPolicy: DropPolicyBlock,
+	})
+}
+
+// NewPoolWithConfig creates a new worker pool with custom configuration.
+func NewPoolWithConfig(ctx context.Context, cfg PoolConfig) *Pool {
+	if cfg.Workers <= 0 {
+		cfg.Workers = 1
 	}
-	if queueSize < 0 {
-		queueSize = 0
+	if cfg.QueueSize < 0 {
+		cfg.QueueSize = 0
 	}
 
 	poolCtx, cancel := context.WithCancel(ctx)
 
 	p := &Pool{
-		workers:  workers,
-		jobQueue: make(chan Job, queueSize),
-		results:  make(chan Result, queueSize),
-		ctx:      poolCtx,
-		cancel:   cancel,
+		workers:    cfg.Workers,
+		jobQueue:   make(chan Job, cfg.QueueSize),
+		results:    make(chan Result, cfg.QueueSize),
+		ctx:        poolCtx,
+		cancel:     cancel,
+		dropPolicy: cfg.DropPolicy,
 	}
 
 	// Start workers
-	for i := 0; i < workers; i++ {
+	for i := 0; i < cfg.Workers; i++ {
 		p.wg.Add(1)
 		go p.worker(i)
 	}
@@ -89,6 +137,8 @@ func (p *Pool) worker(id int) {
 			}
 			// Execute the job
 			value, err := job.Execute(p.ctx)
+			atomic.AddUint64(&p.jobsCompleted, 1)
+
 			// Send result (non-blocking if channel full, result is dropped)
 			select {
 			case p.results <- Result{JobID: job.ID, Value: value, Err: err}:
@@ -100,31 +150,102 @@ func (p *Pool) worker(id int) {
 }
 
 // Submit adds a job to the pool's queue.
-// It blocks if the queue is full until space is available or context is cancelled.
-// Returns an error if the pool is closed or context is cancelled.
+// Behavior depends on the configured DropPolicy:
+//   - DropPolicyBlock: blocks until space is available (default)
+//   - DropPolicyNewest: returns ErrBackpressure if queue is full
+//   - DropPolicyOldest: drops oldest job to make room for new one
+//
+// Returns an error if the pool is closed, context is cancelled, or backpressure applied.
 func (p *Pool) Submit(job Job) error {
 	select {
 	case <-p.ctx.Done():
 		return p.ctx.Err()
+	default:
+	}
+
+	switch p.dropPolicy {
+	case DropPolicyBlock:
+		// Default: block until space available
+		select {
+		case <-p.ctx.Done():
+			return p.ctx.Err()
+		case p.jobQueue <- job:
+			atomic.AddUint64(&p.jobsSubmitted, 1)
+			return nil
+		}
+
+	case DropPolicyNewest:
+		// Non-blocking: reject if full
+		select {
+		case p.jobQueue <- job:
+			atomic.AddUint64(&p.jobsSubmitted, 1)
+			return nil
+		default:
+			atomic.AddUint64(&p.jobsDropped, 1)
+			return ErrBackpressure
+		}
+
+	case DropPolicyOldest:
+		// Non-blocking: drop oldest if full
+		select {
+		case p.jobQueue <- job:
+			atomic.AddUint64(&p.jobsSubmitted, 1)
+			return nil
+		default:
+			// Queue full, try to drop oldest
+			select {
+			case <-p.jobQueue:
+				atomic.AddUint64(&p.jobsDropped, 1)
+			default:
+				// Queue became empty, try again
+			}
+			// Try to submit again
+			select {
+			case p.jobQueue <- job:
+				atomic.AddUint64(&p.jobsSubmitted, 1)
+				return nil
+			default:
+				atomic.AddUint64(&p.jobsDropped, 1)
+				return ErrBackpressure
+			}
+		}
+	}
+
+	return nil
+}
+
+// TrySubmit attempts to submit a job without blocking.
+// Returns ErrBackpressure if the queue is full.
+func (p *Pool) TrySubmit(job Job) error {
+	select {
+	case <-p.ctx.Done():
+		return p.ctx.Err()
 	case p.jobQueue <- job:
+		atomic.AddUint64(&p.jobsSubmitted, 1)
 		return nil
+	default:
+		return ErrBackpressure
 	}
 }
 
 // SubmitAndWait submits multiple jobs and waits for all results.
 // Returns results in the order they complete (not submission order).
+// If submission fails partway through, only waits for successfully submitted jobs.
 func (p *Pool) SubmitAndWait(jobs []Job) []Result {
-	// Submit all jobs
+	// Submit all jobs, tracking how many were successfully submitted
+	submitted := 0
 	for _, job := range jobs {
 		if err := p.Submit(job); err != nil {
-			// Context cancelled, return partial results
+			// Context cancelled or queue full, stop submitting
 			break
 		}
+		submitted++
 	}
 
-	// Collect results
-	results := make([]Result, 0, len(jobs))
-	for i := 0; i < len(jobs); i++ {
+	// Only collect results for jobs that were actually submitted
+	// This prevents deadlock when Submit fails partway through
+	results := make([]Result, 0, submitted)
+	for i := 0; i < submitted; i++ {
 		select {
 		case <-p.ctx.Done():
 			return results
@@ -159,4 +280,19 @@ func (p *Pool) Workers() int {
 // QueueLen returns the current number of jobs waiting in the queue.
 func (p *Pool) QueueLen() int {
 	return len(p.jobQueue)
+}
+
+// Stats returns current pool statistics.
+func (p *Pool) Stats() PoolStats {
+	return PoolStats{
+		JobsSubmitted: atomic.LoadUint64(&p.jobsSubmitted),
+		JobsCompleted: atomic.LoadUint64(&p.jobsCompleted),
+		JobsDropped:   atomic.LoadUint64(&p.jobsDropped),
+		QueueLength:   len(p.jobQueue),
+	}
+}
+
+// DropPolicy returns the configured drop policy.
+func (p *Pool) DropPolicy() DropPolicy {
+	return p.dropPolicy
 }
