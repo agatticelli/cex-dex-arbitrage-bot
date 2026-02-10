@@ -40,7 +40,7 @@ Real-time arbitrage detection system that monitors price discrepancies between B
 
 ### Prerequisites
 
-- Go 1.24+
+- Go 1.25+
 - Docker and Docker Compose
 - Ethereum RPC access (Infura or Alchemy)
 

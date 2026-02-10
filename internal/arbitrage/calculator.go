@@ -47,7 +47,7 @@ func (c *Calculator) CalculateProfit(
 	if baseDecimals == 0 {
 		baseDecimals = 18
 	}
-	tradeSizeBase := rawToFloat(tradeSize, baseDecimals)
+	tradeSizeBase := pricing.RawToFloat(tradeSize, baseDecimals)
 
 	if cexPrice.AmountOut == nil || dexPrice.AmountOut == nil {
 		return nil, fmt.Errorf("AmountOut fields are required for accurate profit calculation")
@@ -191,9 +191,9 @@ func (c *Calculator) CalculateBreakEven(
 		baseDecimals = 18
 	}
 
-	minSize := floatToRaw(0.1, baseDecimals)
-	maxSize := floatToRaw(100.0, baseDecimals)
-	step := floatToRaw(0.1, baseDecimals)
+	minSize := pricing.FloatToRaw(big.NewFloat(0.1), baseDecimals)
+	maxSize := pricing.FloatToRaw(big.NewFloat(100.0), baseDecimals)
+	step := pricing.FloatToRaw(big.NewFloat(0.1), baseDecimals)
 
 	for size := new(big.Int).Set(minSize); size.Cmp(maxSize) <= 0; size.Add(size, step) {
 		metrics, err := c.CalculateProfit(direction, size, cexPrice, dexPrice, gasCostUSD)
@@ -224,7 +224,7 @@ func (c *Calculator) CalculateMaxProfitableSize(
 	if baseDecimals == 0 {
 		baseDecimals = 18
 	}
-	minStep := floatToRaw(0.1, baseDecimals)
+	minStep := pricing.FloatToRaw(big.NewFloat(0.1), baseDecimals)
 	if step.Cmp(minStep) < 0 {
 		step = minStep
 	}

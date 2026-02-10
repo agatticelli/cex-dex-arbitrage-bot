@@ -10,8 +10,8 @@ func pow10(decimals int) *big.Int {
 	return new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil)
 }
 
-// rawToFloat converts a raw integer amount into a human-readable float using decimals.
-func rawToFloat(raw *big.Int, decimals int) *big.Float {
+// RawToFloat converts a raw integer amount into a human-readable float using decimals.
+func RawToFloat(raw *big.Int, decimals int) *big.Float {
 	if raw == nil {
 		return big.NewFloat(0)
 	}
@@ -20,8 +20,8 @@ func rawToFloat(raw *big.Int, decimals int) *big.Float {
 	return new(big.Float).Quo(val, scale)
 }
 
-// floatToRaw converts a human-readable float into a raw integer amount using decimals.
-func floatToRaw(val *big.Float, decimals int) *big.Int {
+// FloatToRaw converts a human-readable float into a raw integer amount using decimals.
+func FloatToRaw(val *big.Float, decimals int) *big.Int {
 	if val == nil {
 		return big.NewInt(0)
 	}

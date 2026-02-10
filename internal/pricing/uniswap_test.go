@@ -397,7 +397,7 @@ func TestRawToFloat(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := rawToFloat(tt.raw, tt.decimals)
+			result := RawToFloat(tt.raw, tt.decimals)
 			resultFloat, _ := result.Float64()
 
 			tolerance := 0.0001

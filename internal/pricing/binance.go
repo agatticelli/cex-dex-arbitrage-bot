@@ -177,7 +177,7 @@ func (b *BinanceProvider) getPrice(ctx context.Context, symbol string, size *big
 	}
 
 	// Convert size from raw units to base token amount
-	baseSize := rawToFloat(size, baseDecimals)
+	baseSize := RawToFloat(size, baseDecimals)
 
 	// Try cache first
 	cacheKey := fmt.Sprintf("binance:orderbook:%s", symbol)
@@ -238,7 +238,7 @@ func (b *BinanceProvider) getPrice(ctx context.Context, symbol string, size *big
 	}
 
 	// Convert to raw format using quote decimals
-	amountOutRawInt := floatToRaw(amountOutQuote, quoteDecimals)
+	amountOutRawInt := FloatToRaw(amountOutQuote, quoteDecimals)
 
 	// Record metrics
 	duration := time.Since(start)

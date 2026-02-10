@@ -34,7 +34,6 @@ type Subscriber struct {
 	wsURLs            []string
 	currentURLIdx     int
 	client            *ethclient.Client
-	subscription      interface{}
 	logger            *observability.Logger
 	metrics           *observability.Metrics
 	tracer            observability.Tracer
@@ -74,19 +73,17 @@ type SubscriberConfig struct {
 
 // ReconnectConfig holds reconnection configuration
 type ReconnectConfig struct {
-	MaxBackoff time.Duration
-	BaseDelay  time.Duration
-	MaxDelay   time.Duration
-	Jitter     float64
+	BaseDelay time.Duration
+	MaxDelay  time.Duration
+	Jitter    float64
 }
 
 // DefaultReconnectConfig returns default reconnection configuration
 func DefaultReconnectConfig() ReconnectConfig {
 	return ReconnectConfig{
-		MaxBackoff: 30 * time.Second,
-		BaseDelay:  1 * time.Second,
-		MaxDelay:   30 * time.Second,
-		Jitter:     0.2,
+		BaseDelay: 1 * time.Second,
+		MaxDelay:  30 * time.Second,
+		Jitter:    0.2,
 	}
 }
 
@@ -106,7 +103,7 @@ func NewSubscriber(cfg SubscriberConfig) (*Subscriber, error) {
 	if cfg.MessageTimeout == 0 {
 		cfg.MessageTimeout = 60 * time.Second
 	}
-	if cfg.ReconnectConfig.MaxBackoff == 0 {
+	if cfg.ReconnectConfig.MaxDelay == 0 {
 		cfg.ReconnectConfig = DefaultReconnectConfig()
 	}
 	if cfg.PollInterval == 0 {

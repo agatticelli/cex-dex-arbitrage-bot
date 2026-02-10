@@ -44,8 +44,9 @@ type ExchangesConfig struct {
 }
 
 type BinanceConfig struct {
-	BaseURL   string          `mapstructure:"base_url"`
-	RateLimit RateLimitConfig `mapstructure:"rate_limit"`
+	BaseURL    string          `mapstructure:"base_url"`
+	RateLimit  RateLimitConfig `mapstructure:"rate_limit"`
+	TradingFee float64         `mapstructure:"trading_fee"`
 }
 
 type RateLimitConfig struct {
@@ -290,6 +291,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("exchanges.binance.base_url", "https://api.binance.com")
 	v.SetDefault("exchanges.binance.rate_limit.requests_per_minute", 1200)
 	v.SetDefault("exchanges.binance.rate_limit.burst", 50)
+	v.SetDefault("exchanges.binance.trading_fee", 0.001) // 0.1% Binance default fee
 
 	v.SetDefault("uniswap.quoter_address", "0x61fFE014bA17989E743c5F6cB21bF9697530B21e")
 	v.SetDefault("uniswap.pool_address", "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640")

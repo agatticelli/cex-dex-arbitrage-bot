@@ -6,6 +6,8 @@ import (
 	"math/big"
 	"strings"
 	"time"
+
+	"github.com/agatticelli/cex-dex-arbitrage-bot/internal/pricing"
 )
 
 // Direction represents the direction of an arbitrage opportunity
@@ -73,7 +75,7 @@ func NewOpportunity(blockNumber uint64, direction Direction, tradeSize *big.Int)
 func (o *Opportunity) SetBaseInfo(baseSymbol, quoteSymbol string, baseDecimals int) {
 	o.BaseSymbol = baseSymbol
 	o.QuoteSymbol = quoteSymbol
-	o.TradeSizeBase = rawToFloat(o.TradeSizeRaw, baseDecimals)
+	o.TradeSizeBase = pricing.RawToFloat(o.TradeSizeRaw, baseDecimals)
 }
 
 // SetPrices sets the CEX and DEX prices and calculates price differences

@@ -37,13 +37,6 @@ func newMockPipelineProvider() *mockPipelineProvider {
 	}
 }
 
-func (m *mockPipelineProvider) setPrice(size *big.Int, isBuy bool, price *pricing.Price) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	key := priceKey(size, isBuy)
-	m.prices[key] = price
-}
-
 func (m *mockPipelineProvider) setError(size *big.Int, isBuy bool, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -94,10 +87,6 @@ func (m *mockPipelineProvider) GetPrice(ctx context.Context, size *big.Int, isBu
 		Slippage:   big.NewFloat(0.1),
 		TradingFee: big.NewFloat(0.1),
 	}, nil
-}
-
-func (m *mockPipelineProvider) getCallCount() int64 {
-	return atomic.LoadInt64(&m.callCount)
 }
 
 func priceKey(size *big.Int, isBuy bool) string {

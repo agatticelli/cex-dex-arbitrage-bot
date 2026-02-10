@@ -145,12 +145,6 @@ func mulDivRoundingUp(a, b, denominator *big.Int) *big.Int {
 	return result
 }
 
-// mulDiv performs (a * b) / c with full precision
-func mulDiv(a, b, denominator *big.Int) *big.Int {
-	product := new(big.Int).Mul(a, b)
-	return new(big.Int).Div(product, denominator)
-}
-
 // Q96ToFloat converts a Q96 fixed-point number to float64
 // Useful for human-readable price display
 func Q96ToFloat(sqrtPriceX96 *big.Int) float64 {

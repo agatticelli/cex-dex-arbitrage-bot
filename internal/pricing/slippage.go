@@ -51,8 +51,8 @@ func CalculatePriceImpact(
 	gasEstimate *big.Int,
 ) PriceImpact {
 	// Convert to float for price calculation
-	amountInFloat := rawToFloat(amountIn, inDecimals)
-	amountOutFloat := rawToFloat(amountOut, outDecimals)
+	amountInFloat := RawToFloat(amountIn, inDecimals)
+	amountOutFloat := RawToFloat(amountOut, outDecimals)
 
 	// Calculate effective price (always in quote/base terms)
 	var effectivePrice *big.Float

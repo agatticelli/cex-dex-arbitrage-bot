@@ -227,7 +227,7 @@ func main() {
 		Logger:         logger,
 		Metrics:        metrics,
 		Tracer:         appTracer,
-		TradingFee:     0.001, // 0.1% Binance fee
+		TradingFee:     cfg.Exchanges.Binance.TradingFee,
 	})
 	if err != nil {
 		logger.LogError(ctx, "failed to create Binance provider", err)

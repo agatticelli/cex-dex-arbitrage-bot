@@ -134,72 +134,6 @@ const uniswapV3QuoterABI = `[
 	}
 ]`
 
-// Uniswap V3 Pool ABI (methods needed for pool state)
-const uniswapV3PoolABI = `[
-	{
-		"inputs": [],
-		"name": "slot0",
-		"outputs": [
-			{"internalType": "uint160", "name": "sqrtPriceX96", "type": "uint160"},
-			{"internalType": "int24", "name": "tick", "type": "int24"},
-			{"internalType": "uint16", "name": "observationIndex", "type": "uint16"},
-			{"internalType": "uint16", "name": "observationCardinality", "type": "uint16"},
-			{"internalType": "uint16", "name": "observationCardinalityNext", "type": "uint16"},
-			{"internalType": "uint8", "name": "feeProtocol", "type": "uint8"},
-			{"internalType": "bool", "name": "unlocked", "type": "bool"}
-		],
-		"stateMutability": "view",
-		"type": "function"
-	},
-	{
-		"inputs": [],
-		"name": "liquidity",
-		"outputs": [
-			{"internalType": "uint128", "name": "", "type": "uint128"}
-		],
-		"stateMutability": "view",
-		"type": "function"
-	},
-	{
-		"inputs": [
-			{"internalType": "int16", "name": "wordPosition", "type": "int16"}
-		],
-		"name": "tickBitmap",
-		"outputs": [
-			{"internalType": "uint256", "name": "", "type": "uint256"}
-		],
-		"stateMutability": "view",
-		"type": "function"
-	},
-	{
-		"inputs": [
-			{"internalType": "int24", "name": "tick", "type": "int24"}
-		],
-		"name": "ticks",
-		"outputs": [
-			{"internalType": "uint128", "name": "liquidityGross", "type": "uint128"},
-			{"internalType": "int128", "name": "liquidityNet", "type": "int128"},
-			{"internalType": "uint256", "name": "feeGrowthOutside0X128", "type": "uint256"},
-			{"internalType": "uint256", "name": "feeGrowthOutside1X128", "type": "uint256"},
-			{"internalType": "int56", "name": "tickCumulativeOutside", "type": "int56"},
-			{"internalType": "uint160", "name": "secondsPerLiquidityOutsideX128", "type": "uint160"},
-			{"internalType": "uint32", "name": "secondsOutside", "type": "uint32"},
-			{"internalType": "bool", "name": "initialized", "type": "bool"}
-		],
-		"stateMutability": "view",
-		"type": "function"
-	},
-	{
-		"inputs": [],
-		"name": "tickSpacing",
-		"outputs": [
-			{"internalType": "int24", "name": "", "type": "int24"}
-		],
-		"stateMutability": "view",
-		"type": "function"
-	}
-]`
-
 // NewUniswapProvider creates a new Uniswap V3 provider
 func NewUniswapProvider(cfg UniswapProviderConfig) (*UniswapProvider, error) {
 	if cfg.Client == nil {
@@ -551,7 +485,7 @@ func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int,
 		// Buying base with quote: used quoteExactOutputSingle
 		// firstAmount is the quote input required
 		// size is the base output (what we requested)
-		amountOutBase = rawToFloat(size, u.token1Decimals)
+		amountOutBase = RawToFloat(size, u.token1Decimals)
 
 		// Calculate price impact from actual amounts
 		priceImpact = CalculatePriceImpact(
@@ -561,12 +495,12 @@ func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int,
 			ticksCrossed,
 			gasEstimate,
 		)
-		amountOutQuote = rawToFloat(firstAmount, u.token0Decimals)
+		amountOutQuote = RawToFloat(firstAmount, u.token0Decimals)
 	} else {
 		// Selling base for quote: used quoteExactInputSingle
 		// firstAmount is the quote output received
 		// size is the base input
-		amountOutQuote = rawToFloat(firstAmount, u.token0Decimals)
+		amountOutQuote = RawToFloat(firstAmount, u.token0Decimals)
 
 		// Calculate price impact from actual amounts
 		priceImpact = CalculatePriceImpact(
@@ -624,7 +558,7 @@ func (u *UniswapProvider) getPriceForFeeTier(ctx context.Context, size *big.Int,
 		)
 	} else {
 		// Selling base for quote
-		baseAmount := rawToFloat(size, u.token1Decimals)
+		baseAmount := RawToFloat(size, u.token1Decimals)
 		u.logger.Info("fetched Uniswap price (QuoterV2)",
 			"action", "sell_base_for_quote",
 			"base_input_raw", size.String(),
@@ -704,7 +638,7 @@ func setQuoteSpanAmounts(span observability.Span, size *big.Int, price *Price, i
 // No RPC call - uses size-based heuristics for gas units
 func (u *UniswapProvider) estimateGasCostWithPrice(size *big.Int, gasPrice *big.Int) *big.Int {
 	// Size buckets based on typical Uniswap V3 gas usage (base token decimals)
-	sizeBase := rawToFloat(size, u.token1Decimals)
+	sizeBase := RawToFloat(size, u.token1Decimals)
 	sizeFloat, _ := sizeBase.Float64()
 
 	var estimatedGas int64

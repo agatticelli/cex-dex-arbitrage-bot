@@ -170,10 +170,9 @@ func TestNewSubscriber_CustomConfig(t *testing.T) {
 		PollInterval:      6 * time.Second,
 		MaxWSFailures:     5,
 		ReconnectConfig: ReconnectConfig{
-			MaxBackoff: 60 * time.Second,
-			BaseDelay:  2 * time.Second,
-			MaxDelay:   60 * time.Second,
-			Jitter:     0.3,
+			BaseDelay: 2 * time.Second,
+			MaxDelay:  60 * time.Second,
+			Jitter:    0.3,
 		},
 	}
 
@@ -198,8 +197,8 @@ func TestNewSubscriber_CustomConfig(t *testing.T) {
 	if sub.maxWSFailures != 5 {
 		t.Errorf("Expected maxWSFailures 5, got %d", sub.maxWSFailures)
 	}
-	if sub.reconnectConfig.MaxBackoff != 60*time.Second {
-		t.Errorf("Expected maxBackoff 60s, got %v", sub.reconnectConfig.MaxBackoff)
+	if sub.reconnectConfig.MaxDelay != 60*time.Second {
+		t.Errorf("Expected maxDelay 60s, got %v", sub.reconnectConfig.MaxDelay)
 	}
 	if sub.reconnectConfig.BaseDelay != 2*time.Second {
 		t.Errorf("Expected baseDelay 2s, got %v", sub.reconnectConfig.BaseDelay)
@@ -209,9 +208,6 @@ func TestNewSubscriber_CustomConfig(t *testing.T) {
 func TestDefaultReconnectConfig(t *testing.T) {
 	config := DefaultReconnectConfig()
 
-	if config.MaxBackoff != 30*time.Second {
-		t.Errorf("Expected MaxBackoff 30s, got %v", config.MaxBackoff)
-	}
 	if config.BaseDelay != 1*time.Second {
 		t.Errorf("Expected BaseDelay 1s, got %v", config.BaseDelay)
 	}
@@ -230,10 +226,9 @@ func TestSubscriber_calculateReconnectDelay(t *testing.T) {
 		WebSocketURLs: []string{"ws://localhost:8546"},
 		Logger:        logger,
 		ReconnectConfig: ReconnectConfig{
-			MaxBackoff: 30 * time.Second,
-			BaseDelay:  1 * time.Second,
-			MaxDelay:   30 * time.Second,
-			Jitter:     0.0, // No jitter for predictable tests
+			BaseDelay: 1 * time.Second,
+			MaxDelay:  30 * time.Second,
+			Jitter:    0.0, // No jitter for predictable tests
 		},
 	}
 
@@ -594,10 +589,9 @@ func TestWebSocketReconnectionWithBackoff(t *testing.T) {
 		WebSocketURLs: []string{"ws://localhost:8546"},
 		Logger:        logger,
 		ReconnectConfig: ReconnectConfig{
-			MaxBackoff: 30 * time.Second,
-			BaseDelay:  1 * time.Second,
-			MaxDelay:   30 * time.Second,
-			Jitter:     0.2, // 20% jitter
+			BaseDelay: 1 * time.Second,
+			MaxDelay:  30 * time.Second,
+			Jitter:    0.2, // 20% jitter
 		},
 	}
 

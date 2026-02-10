@@ -371,7 +371,7 @@ provider, err := pricing.NewBinanceProvider(pricing.BinanceProviderConfig{
 ```go
 provider, err := pricing.NewUniswapProvider(pricing.UniswapProviderConfig{
     Client:         ethClient,
-    QuoterAddress:  "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6",
+    QuoterAddress:  "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
     Token0Address:  "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", // USDC
     Token1Address:  "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", // WETH
     Token0Decimals: 6,
